@@ -1,0 +1,119 @@
+﻿LSU is a bottleneck in many applications due to the requirements of memory consistency
+
+
+Stack is used for overflow of architectural state in addition for variables that may be used for interprocess communication
+
+
+Because the stack uses the memory to have an unlimited size, it is also bound by the rules of the memory
+
+
+Use of stacks in programs
+* Function scoped variables
+* Function stack frames
+* Fills and Spills from architectural state
+* Inter process communication
+
+
+Disaggregation of stacks
+* Separate shared process state from thread state
+
+
+
+
+Potential Benefits
+* Reduced latency of stack operations
+   * Similar in impact to Instruction Dependency Predictors (With stack access predictors) in addition to stack forwarding. Both can reach 0 cycle stack access latencies. 
+* Reduced use of limited LSU entries
+   * Because we do not have commitments for multithreaded consistency, we do not need to actually perform loads and stores, saving entries in the LSU 
+* Reduction of LD/ST bandwidth usage
+   * Compared to aggressive latency reduction techniques, we also reduce the quantity of loads and stores required to complete the execution of kernels
+* Reduced cache usage
+   * We can handle elements at the sub-cacheline granularity, so we no longer need to pull in cachelines from DRAM on a cold write to the stack just for correctness
+   * Compared to aggressive latency reduction techniques, we save redundant cacheline usage
+* Reduced coherence traffic and snooping
+   * We do not need to CAM the cache for elements of the private stack
+   * we do not need to track coherence at the cache line granularity
+* Compilers can expose more parallelism
+   * Graphs in parallel vs in series, spills and fills
+
+
+Implementation Considerations
+* Tracking of private stacks
+   * Although the stack is thread private, we still need to deal with thread migrations and context switching. We need some way to transfer the memory backed private stack to a new core
+   * Fine grain (Cacheline like) -> (Page like) -> (stack like)
+   * The cache will need to deliver and hold the lines, but only a single copy of the line needs to be resident in the cache at once.
+   * Ideally the private stacks are either entirely in the memory or partially in a single core
+* OS involvement
+   * Draining of the private stack by the OS can work in a time based way. E.g. after a drain instruction the ISA guarantees within X cycles the core will be drained of private stack entries. In a more limited form this is simply a hint instruction instead of core to correctness.
+      * This is more relevant to maintain performance in a coarse grain tracking model
+   * Draining of the private stack can be handled in a manner similar to cachelines, pulled in block by block
+   * The OS and hardware  may need to jointly maintain a unique ID for each thread. This ID could be used to trigger a full drain in cores with private stacks that are not expected to be run again.
+* Rolling flushes
+   * The processor may speculate that certain stack entries are not likely to be used again, and preemptively drain them to the cache or main memory.
+
+
+Pipeline impacts
+* Decode
+   * Detect accesses to the private and public stacks
+* Rename
+   * Assign names to stack accesses
+* Memory Name
+   * Stack position -> phys reg id OR phys addr 
+* LSU
+   * Effectively remove LSU entries for private stack accesses
+   * Opportunistically drain stack entries to memory for old entries or entries from other threads 
+* TLB / MMU
+   * Needs to handle coherence from context switch
+* L1 Cache
+   * Can be augmented into L1S 
+   * L1S could have snooping insensitive ways to reduce area at the cost of reduced flexibility
+
+
+Operating System Changes
+* The operating system needs to be changed to give disjoint memory pages to each thread for the private stack
+* The compiler may need to change its context switching behavior depending on the synchronization method used by the private cache
+
+
+Compiler changes
+* The compiler needs to determine if variables are visible between threads or not.
+* Unshared state can be placed in the private stack
+* Atomics, and other Inter Process Communication need to be kept in the public stack
+
+
+
+
+Experiments:
+
+
+* Oracle study: What percent of LSU entries/LDST slots might be saved in a typical workload?
+   * Can do trace analysis on multicore workloads to determine distribution
+* Timing study: How do naive LSU, LSU with stack forwarding, and private stack compare in terms of performance?
+   * Can estimate the roofline of this using gem5 without real toolchain support. Naive LSU, Aggressive LSU, Oversized LSU based on trace data
+* What is the cost of doing thread migration with these changes?
+   * We are deferring some loads, and negating others? What is the change with respect to bandwidth requirements of the core?
+
+
+
+
+Workloads
+* PARSEC
+   * https://github.com/bamos/parsec-benchmark
+* GAPBS
+   * https://github.com/sbeamer/gapbs/tree/master
+
+
+
+
+Tracing tool:
+1. Determine the total number of ld/st/push/pop operations that occur during execution
+   1. We will maintain a counter for each type of memory operation
+   2. Pushes and pops will not show up in the ld/st count, to get the total operation count we will add all four counters.
+2. Determine accesses/PCs of loads and stores that are associated with inter-process communication
+   1. We can find the accesses that are hazarded by using a shadow memory with several states (unaccessed, last thread accessed, multithread accessed)
+   2. We will keep track of what percent of stack accesses are ‘strictly interprocess’ and ‘interprocess’
+      1. For strictly interprocess, if we had a load instruction at address 0x3000 which loaded addresses 0x1000, 0x1100, 0x1200, and another load instruction in another thread that loaded 0x1000 - then only the two loads to 0x1000 would be considered
+      2. For interprocess, with the same example, every load done by address 0x3000 would be considered interprocess.
+   3. Although loads and stores can create interprocess communication, and need to be tracked in the shadow memory for correctness, the stats are focused on pushes and pops to the stack
+3. Determine the percentage of push/pop operations that are not strictly interprocess and not interprocess
+   1. In the strict case, by examining the shadow memory, you might simply increment counters for each strictly interprocess push and pop. The complication comes where a push occurs then a load occurs to that address in another thread. The load operation needs to know how many stack operations to add to the counter, as 1 or more operations to that specific address may have occurred in the past
+   2. In the interprocess case, we need to keep track of PCs that accessed memory addresses. One solution is to keep track of the pushes/pops performed at each pc. Each PC could be either in a count state or in a IPC state. When a non-IPC access occurs the counter is incremented (OR if we are in the IPC state, we increment the associated global counter. If the PC is involved in IPC we add the count for the PC to the global count, and transition state.

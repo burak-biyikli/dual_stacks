@@ -9,5 +9,14 @@ if (NOT DynamoRIO_FOUND)
   message(FATAL_ERROR "DynamoRIO package required to build")
 endif()
 
-add_library(analyzer SHARED analyzer.cpp)
+# Build standalone test harness
+add_executable(test_analyzer test_analyzer.c analyzer.c)
+target_link_libraries(test_analyzer pthread)
+
+# Build DynamoRIO client
+add_library(analyzer SHARED dr_client.cpp analyzer.c)
 configure_DynamoRIO_client(analyzer)
+use_DynamoRIO_extension(analyzer drmgr)
+use_DynamoRIO_extension(analyzer drreg)
+use_DynamoRIO_extension(analyzer drutil)
+use_DynamoRIO_extension(analyzer drcontainers)

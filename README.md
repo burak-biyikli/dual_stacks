@@ -17,6 +17,6 @@ The pipeline is split into distinct, sequentially executable scripts for ease of
 
 * **`00_patch_manager.sh`**: A helper script to `apply` existing patches to the `ext/` submodules or `update` them based on your local uncommitted changes.
 * **`01_setup.sh`**: Initializes the environment by pulling submodules, installing system dependencies, compiling DynamoRIO, GAPBS, our C++ analyzer, and building gem5.
-* **`02_test.sh`**: Health check script that executes "Hello World" sanity checks on the native machine, DynamoRIO, GAPBS, PARSEC, and gem5 to ensure everything is functioning perfectly.
+* **`02_test.sh`**: Health check script that executes "Hello World" sanity checks on the native machine, DynamoRIO, GAPBS, PARSEC, and gem5 to ensure everything is functioning.
 
 *(Future scripts to be added: `03_profile_workloads.py`, `04_run_simulations.py`, `05_extract_data.py`)*
