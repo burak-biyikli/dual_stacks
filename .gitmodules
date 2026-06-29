@@ -1,0 +1,12 @@
+[submodule "ext/gem5"]
+	path = ext/gem5
+	url = https://github.com/gem5/gem5.git
+[submodule "ext/dynamorio"]
+	path = ext/dynamorio
+	url = https://github.com/DynamoRIO/dynamorio.git
+[submodule "ext/gapbs"]
+	path = ext/gapbs
+	url = https://github.com/sbeamer/gapbs.git
+[submodule "ext/parsec-benchmark"]
+	path = ext/parsec-benchmark
+	url = https://github.com/cirosantilli/parsec-benchmark.git

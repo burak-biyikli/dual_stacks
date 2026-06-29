@@ -1,0 +1,15 @@
+# Build directories
+build/
+ext/*/build/
+ext/*/m5out/
+
+# gem5 output
+m5out/
+
+# Python caching
+__pycache__/
+*.pyc
+
+# IDEs
+.vscode/
+.idea/
