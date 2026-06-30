@@ -85,7 +85,9 @@ static inline uint64_t* get_timestamp_page(uintptr_t addr, bool allocate) {
         if (!allocate) return NULL;
         g_cb.mutex_lock(dir_lock);
         if (!timestamp_dir[t1][t2]) {
-            timestamp_dir[t1][t2] = (uint64_t*)calloc(65536, 8); // 8 bytes per slot
+            uint64_t *page = (uint64_t*)malloc(65536 * 8); // 8 bytes per slot
+            memset(page, 0xFF, 65536 * 8); // UINT64_MAX means unpushed or popped
+            timestamp_dir[t1][t2] = page;
         }
         g_cb.mutex_unlock(dir_lock);
     }
@@ -162,7 +164,7 @@ static addr_detail_t *l2_create(uintptr_t addr, size_t size, uint8_t tid) {
     n->owner_tid = tid;
     n->next = l2_table[h];
     l2_table[h] = n;
-    g_stats.l2_entries_created++;
+    __atomic_fetch_add(&g_stats.l2_entries_created, 1, __ATOMIC_RELAXED);
     return n;
 }
 
@@ -265,7 +267,7 @@ static void drain_l2(uintptr_t curr_addr) {
         }
     }
     
-    g_stats.l2_entries_drained++;
+    __atomic_fetch_add(&g_stats.l2_entries_drained, 1, __ATOMIC_RELAXED);
     l2_delete(base_addr);
     g_cb.mutex_unlock(l2_locks[lock_idx]);
 }
@@ -364,7 +366,7 @@ void analyzer_unregister_thread(uint8_t tid) {
 
 void analyzer_on_push(uint8_t tid, uintptr_t addr, size_t size, uintptr_t pc) {
     assert(size <= 256 && "Memory access size exceeds 1-byte offset capacity");
-    g_stats.total_push++;
+    __atomic_fetch_add(&g_stats.total_push, 1, __ATOMIC_RELAXED);
     
     uint8_t *page = get_shadow_page(addr, true);
     uint32_t offset = addr & 0xFFFF;
@@ -408,7 +410,7 @@ void analyzer_on_push(uint8_t tid, uintptr_t addr, size_t size, uintptr_t pc) {
 
 void analyzer_on_pop(uint8_t tid, uintptr_t addr, size_t size, uintptr_t pc) {
     assert(size <= 256 && "Memory access size exceeds 1-byte offset capacity");
-    g_stats.total_pop++;
+    __atomic_fetch_add(&g_stats.total_pop, 1, __ATOMIC_RELAXED);
     uint8_t *page = get_shadow_page(addr, true);
     uint32_t offset = addr & 0xFFFF;
     
@@ -420,11 +422,14 @@ void analyzer_on_pop(uint8_t tid, uintptr_t addr, size_t size, uintptr_t pc) {
         uint64_t *ts_page = get_timestamp_page(base_addr, false);
         if (ts_page) {
             uint64_t push_time = ts_page[base_addr & 0xFFFF];
-            uint64_t current_time = g_threads[tid].logical_clock;
-            if (current_time >= push_time) {
-                uint64_t lifetime = current_time - push_time;
-                if (lifetime > 2048) lifetime = 2048; // cap to highest bin
-                __sync_fetch_and_add(&global_lifetime_histogram[lifetime], 1);
+            if (push_time != UINT64_MAX) {
+                uint64_t current_time = g_threads[tid].logical_clock;
+                if (current_time >= push_time) {
+                    uint64_t lifetime = current_time - push_time;
+                    if (lifetime > 2048) lifetime = 2048; // cap to highest bin
+                    __sync_fetch_and_add(&global_lifetime_histogram[lifetime], 1);
+                }
+                ts_page[base_addr & 0xFFFF] = UINT64_MAX; // Mark as popped
             }
         }
     }
@@ -448,7 +453,7 @@ void analyzer_on_pop(uint8_t tid, uintptr_t addr, size_t size, uintptr_t pc) {
 }
 
 void analyzer_on_ld(uint8_t tid, uintptr_t addr, size_t size) {
-    g_stats.total_ld++;
+    __atomic_fetch_add(&g_stats.total_ld, 1, __ATOMIC_RELAXED);
     uint8_t *page = get_shadow_page(addr, true);
     uint32_t offset = addr & 0xFFFF;
     
@@ -469,7 +474,7 @@ void analyzer_on_ld(uint8_t tid, uintptr_t addr, size_t size) {
 }
 
 void analyzer_on_st(uint8_t tid, uintptr_t addr, size_t size) {
-    g_stats.total_st++;
+    __atomic_fetch_add(&g_stats.total_st, 1, __ATOMIC_RELAXED);
     uint8_t *page = get_shadow_page(addr, true);
     uint32_t offset = addr & 0xFFFF;
     
@@ -529,6 +534,30 @@ void analyzer_cleanup(void) {
             if (timestamp_dir[i]) {
                 for (int j = 0; j < 65536; j++) {
                     if (timestamp_dir[i][j]) {
+                        // Scan for hanging pushes before freeing
+                        for (int k = 0; k < 65536; k++) {
+                            uint64_t push_time = timestamp_dir[i][j][k];
+                            if (push_time != UINT64_MAX) {
+                                uint64_t current_time = 0;
+                                uint8_t tid = 0;
+                                if (shadow_dir && shadow_dir[i] && shadow_dir[i][j]) {
+                                    tid = shadow_dir[i][j][k];
+                                }
+                                if (tid > 0 && tid <= MAX_TID && tid != SHARED_TAG) {
+                                    current_time = g_threads[tid].logical_clock;
+                                } else {
+                                    // Approximate with max clock among all threads
+                                    for (int t = 1; t <= MAX_TID; t++) {
+                                        if (g_threads[t].logical_clock > current_time) {
+                                            current_time = g_threads[t].logical_clock;
+                                        }
+                                    }
+                                }
+                                uint64_t lifetime = (current_time > push_time) ? (current_time - push_time) : 0;
+                                if (lifetime > 2048) lifetime = 2048;
+                                global_lifetime_histogram[lifetime]++;
+                            }
+                        }
                         free(timestamp_dir[i][j]);
                     }
                 }

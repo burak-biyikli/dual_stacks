@@ -53,6 +53,7 @@ To trace the Breadth-First Search (BFS) algorithm from the GAP Benchmark Suite o
 $DRRUN -c $CLIENT -- ../../ext/gapbs/bfs -g 10 -n 1
 ```
 
+
 ### Running a PARSEC Benchmark
 To trace `blackscholes` from the PARSEC benchmark suite using the `simsmall` input, you can pass `drrun` directly to the `parsecmgmt` wrapper script via the `-s` flag:
 ```bash

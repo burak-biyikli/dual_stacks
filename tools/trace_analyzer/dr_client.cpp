@@ -124,18 +124,20 @@ static dr_emit_flags_t event_app_instruction(void *drcontext, void *tag, instrli
     bool is_push = (opcode == OP_push || opcode == OP_pusha || opcode == OP_pushf);
     bool is_pop  = (opcode == OP_pop || opcode == OP_popa || opcode == OP_popf);
     
-    dr_mutex_lock(pc_table_mutex);
-    pc_global_t *g = (pc_global_t *)hashtable_lookup(&pc_table, (void*)pc);
-    if (!g) {
-        g = (pc_global_t *)dr_global_alloc(sizeof(pc_global_t));
-        g->total_count = 0;
-        g->is_ipc = false;
-        g->is_push = is_push;
-        hashtable_add(&pc_table, (void*)pc, g);
+    if (is_push || is_pop) {
+        dr_mutex_lock(pc_table_mutex);
+        pc_global_t *g = (pc_global_t *)hashtable_lookup(&pc_table, (void*)pc);
+        if (!g) {
+            g = (pc_global_t *)dr_global_alloc(sizeof(pc_global_t));
+            g->total_count = 0;
+            g->is_ipc = false;
+            g->is_push = is_push;
+            hashtable_add(&pc_table, (void*)pc, g);
+        }
+        dr_mutex_unlock(pc_table_mutex);
+        
+        dr_insert_clean_call(drcontext, bb, instr, (void *)clean_call_inc_pc, false, 1, OPND_CREATE_INTPTR(pc));
     }
-    dr_mutex_unlock(pc_table_mutex);
-    
-    dr_insert_clean_call(drcontext, bb, instr, (void *)clean_call_inc_pc, false, 1, OPND_CREATE_INTPTR(pc));
 
     for (int i = 0; i < instr_num_srcs(instr); i++) {
         opnd_t op = instr_get_src(instr, i);
@@ -294,10 +296,22 @@ static void event_exit(void) {
     analyzer_cleanup();
 }
 
+static dr_signal_action_t event_signal(void *drcontext, dr_siginfo_t *info) {
+    if (info->sig == 15 /* SIGTERM */ || info->sig == 2 /* SIGINT */) {
+        dr_fprintf(STDERR, "Received termination signal %d. Exiting gracefully...\n", info->sig);
+        dr_exit_process(1);
+        return DR_SIGNAL_SUPPRESS;
+    }
+    return DR_SIGNAL_DELIVER;
+}
+
 DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
     dr_set_client_name("DynamoRIO Stack Privacy Analyzer", "http://dynamorio.org/issues");
     
     drmgr_init();
+    
+    drmgr_register_signal_event(event_signal);
+    
     drreg_options_t ops = {sizeof(ops), 3, false};
     drreg_init(&ops);
     drutil_init();

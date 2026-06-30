@@ -5,6 +5,7 @@ ext/*/m5out/
 
 # gem5 output
 m5out/
+results/tmp/
 
 # Python caching
 __pycache__/
