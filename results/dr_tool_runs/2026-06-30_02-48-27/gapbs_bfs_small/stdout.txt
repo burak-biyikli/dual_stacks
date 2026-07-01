@@ -1,5 +1,0 @@
-Generate Time:       2.36194
-Build Time:          0.55828
-Graph has 32768 nodes and 441438 undirected edges for degree: 13
-Trial Time:          0.07625
-Average Time:        0.07625

@@ -1,10 +1,6 @@
 cmake_minimum_required(VERSION 3.10)
 project(trace_analyzer)
 
-# Set C++ standard
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
 # Point to DynamoRIO's cmake directory
 set(DynamoRIO_DIR ${CMAKE_SOURCE_DIR}/../../ext/dynamorio/build/cmake)
 
@@ -14,13 +10,11 @@ if (NOT DynamoRIO_FOUND)
 endif()
 
 # Build standalone test harness
-add_executable(test_analyzer tests/test_analyzer.cpp analyzer.cpp)
-add_executable(test_fuzzer tests/test_fuzzer_minimal_stress.cpp)
+add_executable(test_analyzer test_analyzer.c analyzer.c)
 target_link_libraries(test_analyzer pthread)
-target_link_libraries(test_fuzzer pthread)
 
 # Build DynamoRIO client
-add_library(analyzer SHARED dr_client.cpp analyzer.cpp)
+add_library(analyzer SHARED dr_client.cpp analyzer.c)
 configure_DynamoRIO_client(analyzer)
 use_DynamoRIO_extension(analyzer drmgr)
 use_DynamoRIO_extension(analyzer drreg)

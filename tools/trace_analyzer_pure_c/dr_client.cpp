@@ -2,37 +2,40 @@
 #include "drmgr.h"
 #include "drreg.h"
 #include "drutil.h"
+#include "hashtable.h"
 #include "analyzer.h"
 #include <string.h>
 #include <stddef.h>
 
 static int tls_idx;
+static hashtable_t pc_table;
+static void *pc_table_mutex;
 
 typedef struct {
     uint8_t tid;
-    uintptr_t ghr;
 } per_thread_t;
+
+typedef struct {
+    uint64_t total_count;
+    bool is_ipc;
+    bool is_push;
+} pc_global_t;
 
 static uint8_t next_tid = 1;
 static void *tid_mutex;
 
+static void cb_mark_pc_ipc(uintptr_t pc, bool is_push) {
+    dr_mutex_lock(pc_table_mutex);
+    pc_global_t *g = (pc_global_t *)hashtable_lookup(&pc_table, (void*)pc);
+    if (g) {
+        g->is_ipc = true;
+    }
+    dr_mutex_unlock(pc_table_mutex);
+}
+
 static uint32_t global_strict_ipc_push[MAX_TID + 1];
 static uint32_t global_strict_ipc_pop[MAX_TID + 1];
 static void *ipc_mutex;
-
-
-static void* cb_mutex_create() {
-    return dr_mutex_create();
-}
-static void cb_mutex_destroy(void* m) {
-    dr_mutex_destroy(m);
-}
-static void cb_mutex_lock(void* m) {
-    dr_mutex_lock(m);
-}
-static void cb_mutex_unlock(void* m) {
-    dr_mutex_unlock(m);
-}
 
 static void cb_add_strict_ipc_impl(uint8_t tid, uint32_t pushes, uint32_t pops) {
     dr_mutex_lock(ipc_mutex);
@@ -45,18 +48,16 @@ static void cb_log_debug(const char *msg) {
     dr_fprintf(STDERR, "[Analyzer Debug] %s\n", msg);
 }
 
-static inline uint8_t get_ctx_hash(uintptr_t ghr);
-
 static void clean_call_push(app_pc pc, app_pc addr, uint32_t size) {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-    analyzer_on_push(pt->tid, (uintptr_t)addr, size, (uintptr_t)pc, get_ctx_hash(pt->ghr));
+    analyzer_on_push(pt->tid, (uintptr_t)addr, size, (uintptr_t)pc);
 }
 
 static void clean_call_pop(app_pc pc, app_pc addr, uint32_t size) {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-    analyzer_on_pop(pt->tid, (uintptr_t)addr, size, (uintptr_t)pc, get_ctx_hash(pt->ghr));
+    analyzer_on_pop(pt->tid, (uintptr_t)addr, size, (uintptr_t)pc);
 }
 
 static void clean_call_ld(app_pc pc, app_pc addr, uint32_t size) {
@@ -71,31 +72,19 @@ static void clean_call_st(app_pc pc, app_pc addr, uint32_t size) {
     analyzer_on_st(pt->tid, (uintptr_t)addr, size);
 }
 
+static void clean_call_inc_pc(app_pc pc) {
+    dr_mutex_lock(pc_table_mutex);
+    pc_global_t *g = (pc_global_t *)hashtable_lookup(&pc_table, (void*)pc);
+    if (g) {
+        g->total_count++;
+    }
+    dr_mutex_unlock(pc_table_mutex);
+}
+
 static void clean_call_add_clock(uint32_t ticks) {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-    analyzer_add_logical_clock(pt->tid, ticks);
-}
-
-
-#define GHR_SHIFT_AMOUNT 22
-#define CTX_HASH_BITS 3
-#define CTX_BUCKETS (1 << CTX_HASH_BITS)
-
-static inline uint8_t get_ctx_hash(uintptr_t ghr) {
-    // MurmurHash3 64-bit finalizer
-    ghr ^= ghr >> 33;
-    ghr *= 0xff51afd7ed558ccdULL;
-    ghr ^= ghr >> 33;
-    ghr *= 0xc4ceb9fe1a85ec53ULL;
-    ghr ^= ghr >> 33;
-    return (uint8_t)(ghr & (CTX_BUCKETS - 1));
-}
-
-static void clean_call_bb_entry(app_pc bb_pc) {
-    void *drcontext = dr_get_current_drcontext();
-    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-    pt->ghr = (pt->ghr << GHR_SHIFT_AMOUNT) ^ (uintptr_t)bb_pc;
+    analyzer_update_clock(pt->tid, ticks);
 }
 
 static dr_emit_flags_t event_app_analysis(void *drcontext, void *tag, instrlist_t *bb,
@@ -106,7 +95,7 @@ static dr_emit_flags_t event_app_analysis(void *drcontext, void *tag, instrlist_
         for (int i = 0; i < instr_num_dsts(instr); i++) {
             if (opnd_is_reg(instr_get_dst(instr, i))) {
                 reg_writes++;
-                break;
+                break; // 1 assignment per instruction max to count instructions doing reg assignment
             }
         }
     }
@@ -117,10 +106,7 @@ static dr_emit_flags_t event_app_analysis(void *drcontext, void *tag, instrlist_
 static dr_emit_flags_t event_app_instruction(void *drcontext, void *tag, instrlist_t *bb,
                                              instr_t *instr, bool for_trace,
                                              bool translating, void *user_data) {
-
     if (drmgr_is_first_instr(drcontext, instr)) {
-        dr_insert_clean_call(drcontext, bb, instr, (void *)clean_call_bb_entry, false, 1, OPND_CREATE_INTPTR(tag));
-
         uint32_t reg_writes = (uint32_t)(uintptr_t)user_data;
         if (reg_writes > 0) {
             dr_insert_clean_call(drcontext, bb, instr, (void *)clean_call_add_clock, false, 1, OPND_CREATE_INT32(reg_writes));
@@ -138,6 +124,21 @@ static dr_emit_flags_t event_app_instruction(void *drcontext, void *tag, instrli
     bool is_push = (opcode == OP_push || opcode == OP_pusha || opcode == OP_pushf);
     bool is_pop  = (opcode == OP_pop || opcode == OP_popa || opcode == OP_popf);
     
+    if (is_push || is_pop) {
+        dr_mutex_lock(pc_table_mutex);
+        pc_global_t *g = (pc_global_t *)hashtable_lookup(&pc_table, (void*)pc);
+        if (!g) {
+            g = (pc_global_t *)dr_global_alloc(sizeof(pc_global_t));
+            g->total_count = 0;
+            g->is_ipc = false;
+            g->is_push = is_push;
+            hashtable_add(&pc_table, (void*)pc, g);
+        }
+        dr_mutex_unlock(pc_table_mutex);
+        
+        dr_insert_clean_call(drcontext, bb, instr, (void *)clean_call_inc_pc, false, 1, OPND_CREATE_INTPTR(pc));
+    }
+
     for (int i = 0; i < instr_num_srcs(instr); i++) {
         opnd_t op = instr_get_src(instr, i);
         if (opnd_is_memory_reference(op)) {
@@ -214,6 +215,10 @@ static void event_thread_exit(void *drcontext) {
     dr_thread_free(drcontext, pt, sizeof(per_thread_t));
 }
 
+static void free_pc_payload(void *payload) {
+    dr_global_free(payload, sizeof(pc_global_t));
+}
+
 static void event_exit(void) {
     analyzer_stats_t stats;
     analyzer_get_stats(&stats);
@@ -222,10 +227,20 @@ static void event_exit(void) {
     uint64_t sum_possible_pop = 0;
     uint32_t unique_pcs = 0;
     uint32_t unique_ipc_pcs = 0;
-    uint64_t hist_sum_push = 0;
-    uint64_t hist_sum_pop = 0;
     
-    analyzer_get_pc_stats(&sum_possible_push, &sum_possible_pop, &hist_sum_push, &hist_sum_pop, &unique_pcs, &unique_ipc_pcs);
+    for (uint i = 0; i < HASHTABLE_SIZE(pc_table.table_bits); i++) {
+        hash_entry_t *e = pc_table.table[i];
+        while (e) {
+            pc_global_t *g = (pc_global_t *)e->payload;
+            unique_pcs++;
+            if (g->is_ipc) {
+                unique_ipc_pcs++;
+                if (g->is_push) sum_possible_push += g->total_count;
+                else            sum_possible_pop += g->total_count;
+            }
+            e = e->next;
+        }
+    }
     
     uint32_t total_strict_push = 0;
     uint32_t total_strict_pop = 0;
@@ -236,9 +251,6 @@ static void event_exit(void) {
     
     uint64_t final_possible_push = (sum_possible_push > total_strict_push) ? sum_possible_push - total_strict_push : 0;
     uint64_t final_possible_pop  = (sum_possible_pop > total_strict_pop) ? sum_possible_pop - total_strict_pop : 0;
-    
-    uint64_t hist_final_push = (hist_sum_push > total_strict_push) ? hist_sum_push - total_strict_push : 0;
-    uint64_t hist_final_pop  = (hist_sum_pop > total_strict_pop) ? hist_sum_pop - total_strict_pop : 0;
     
     uint64_t total_mem = stats.total_ld + stats.total_st + stats.total_push + stats.total_pop;
     uint64_t total_stack = stats.total_push + stats.total_pop;
@@ -252,14 +264,11 @@ static void event_exit(void) {
     dr_fprintf(STDERR, "\nStack Operations (PUSH+POP): %llu\n", total_stack);
     
     uint64_t provably_private = total_stack - total_strict_push - total_strict_pop - final_possible_push - final_possible_pop;
-    dr_fprintf(STDERR, "  Provably Private:                        %llu\n", provably_private);
-    dr_fprintf(STDERR, "  Strictly IPC (Instance Level):           %u\n", total_strict_push + total_strict_pop);
-    dr_fprintf(STDERR, "  Possibly IPC (Non-History):              %llu\n", final_possible_push + final_possible_pop);
-    dr_fprintf(STDERR, "  Possibly IPC (History-Based, %d buckets): %llu\n", CTX_BUCKETS, hist_final_push + hist_final_pop);
-    dr_fprintf(STDERR, "\nUnique Raw Stack PCs:          %u\n", unique_pcs);
-    dr_fprintf(STDERR, "Unique Raw Stack PCs with IPC: %u\n", unique_ipc_pcs);
-    
-    analyzer_drain_hanging_pushes();
+    dr_fprintf(STDERR, "  Provably Private:              %llu\n", provably_private);
+    dr_fprintf(STDERR, "  Strictly IPC (Instance Level): %u\n", total_strict_push + total_strict_pop);
+    dr_fprintf(STDERR, "  Possibly IPC (PC Level):       %llu\n", final_possible_push + final_possible_pop);
+    dr_fprintf(STDERR, "\nUnique Stack PCs:          %u\n", unique_pcs);
+    dr_fprintf(STDERR, "Unique Stack PCs with IPC: %u\n", unique_ipc_pcs);
     
     dr_fprintf(STDERR, "\n=== Stack Lifetime Histogram (Register Assignments) ===\n");
     const uint64_t* histo = analyzer_get_histogram();
@@ -270,6 +279,8 @@ static void event_exit(void) {
         }
     }
     
+    hashtable_delete(&pc_table);
+    dr_mutex_destroy(pc_table_mutex);
     dr_mutex_destroy(tid_mutex);
     dr_mutex_destroy(ipc_mutex);
     
@@ -307,21 +318,25 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
     
     tls_idx = drmgr_register_tls_field();
     
+    pc_table_mutex = dr_mutex_create();
     tid_mutex = dr_mutex_create();
     ipc_mutex = dr_mutex_create();
+    
+    hashtable_init_ex(&pc_table, 16, HASH_INTPTR, false, false, free_pc_payload, NULL, NULL);
     
     memset(global_strict_ipc_push, 0, sizeof(global_strict_ipc_push));
     memset(global_strict_ipc_pop, 0, sizeof(global_strict_ipc_pop));
     
-    analyzer_callbacks_t cb = {};
-    cb.mutex_create = cb_mutex_create;
-    cb.mutex_destroy = cb_mutex_destroy;
-    cb.mutex_lock = cb_mutex_lock;
-    cb.mutex_unlock = cb_mutex_unlock;
-    cb.add_strict_ipc = cb_add_strict_ipc_impl;
-    cb.log_debug = cb_log_debug;
-    
-    analyzer_init(&cb);
+    analyzer_callbacks_t cb = {
+        .mark_pc_ipc = cb_mark_pc_ipc,
+        .add_strict_ipc = cb_add_strict_ipc_impl,
+        .log_debug = cb_log_debug,
+        .mutex_create = dr_mutex_create,
+        .mutex_lock = dr_mutex_lock,
+        .mutex_unlock = dr_mutex_unlock,
+        .mutex_destroy = dr_mutex_destroy
+    };
+    analyzer_init(cb);
     
     drmgr_register_thread_init_event(event_thread_init);
     drmgr_register_thread_exit_event(event_thread_exit);

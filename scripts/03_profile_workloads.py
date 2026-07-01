@@ -74,7 +74,8 @@ def parse_analyzer_output(stderr_text):
             "total": r"Stack Operations \(PUSH\+POP\):\s*(\d+)",
             "provably_private": r"Provably Private:\s*(\d+)",
             "strictly_ipc": r"Strictly IPC \(Instance Level\):\s*(\d+)",
-            "possibly_ipc": r"Possibly IPC \(PC Level\):\s*(\d+)"
+            "possibly_ipc_non_hist": r"Possibly IPC \(Non-History\):\s*(\d+)",
+            "possibly_ipc_hist": r"Possibly IPC \(History-Based, \d+ buckets\):\s*(\d+)"
         },
         "pcs": {
             "unique": r"Unique Stack PCs:\s*(\d+)",
@@ -112,32 +113,62 @@ def run_benchmark(bench_name, cmd, cwd, out_dir, timeout_secs):
     stderr_path = bench_dir / "stderr.txt"
     json_path = bench_dir / "parsed_data.json"
     
+    import os
+    import signal
+    import time
+    
     if timeout_secs > 0:
-        # Use GNU timeout to kill the shell and all its children if it hangs
-        cmd = f"timeout --kill-after=10s {timeout_secs} {cmd}"
+        cmd = cmd # Remove timeout wrapper since we handle it in Python
         
     try:
         with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
-            result = subprocess.run(cmd, shell=True, cwd=cwd, stdout=out_f, stderr=err_f)
-            if result.returncode == 124:
-                print(f"  -> Failed: Benchmark timed out after {timeout_secs} seconds.")
-                return
+            process = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=out_f, stderr=err_f, preexec_fn=os.setsid)
+            status = "finished"
+            
+            if timeout_secs > 0:
+                try:
+                    process.wait(timeout=timeout_secs)
+                except subprocess.TimeoutExpired:
+                    status = "timed_out"
+                    os.killpg(os.getpgid(process.pid), signal.SIGINT)
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                        process.wait()
+                    time.sleep(3)  # Allow orphaned drrun to finish dumping to stderr
+            else:
+                process.wait()
+                
+            if status != "timed_out" and process.returncode != 0:
+                status = "failed"
+            
+            # Append status to stdout
+            out_f.write(f"\n[Trace Analyzer Script] Run Status: {status}\n")
             
         with open(stdout_path, "r") as out_f, open(stderr_path, "r") as err_f:
             parsed = parse_analyzer_output(out_f.read() + "\n" + err_f.read())
             
+        parsed["run_status"] = status
+            
         with open(json_path, "w") as j_f:
             json.dump(parsed, j_f, indent=2)
             
-        print(f"  -> Success! Extracted {len(parsed['histogram'])} histogram buckets.")
+        if status == "timed_out":
+            print(f"  -> Warn: Benchmark timed out after {timeout_secs} seconds. Extracted {len(parsed.get('histogram', {}))} histogram buckets.")
+        elif status == "failed":
+            print(f"  -> Failed: Benchmark exited with code {process.returncode}. Extracted {len(parsed.get('histogram', {}))} histogram buckets.")
+        else:
+            print(f"  -> Finished! Extracted {len(parsed.get('histogram', {}))} histogram buckets.")
+            
     except Exception as e:
-        print(f"  -> Failed: {e}")
+        print(f"  -> Failed with exception: {e}")
 
 def main():
     import multiprocessing
     parser = argparse.ArgumentParser(description="Profile workloads with DynamoRIO trace analyzer")
     parser.add_argument("--size", choices=list(SIZE_MAP.keys()) + ["all"], default="test", help="Dataset size to run")
-    parser.add_argument("--threads", type=int, default=multiprocessing.cpu_count(), help="Number of threads to use for benchmarks")
+    parser.add_argument("--threads", type=int, default=4, help="Number of threads to use for benchmarks")
     parser.add_argument("--timeout", type=int, default=360, help="Timeout in seconds for each benchmark (0 to disable)")
     args = parser.parse_args()
     
