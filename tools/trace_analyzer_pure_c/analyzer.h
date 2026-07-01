@@ -11,25 +11,22 @@ extern "C" {
 
 #define MAX_TID 254
 
-// Callbacks provided by the host environment
-typedef void* (*analyzer_mutex_create_fn)(void);
-typedef void (*analyzer_mutex_destroy_fn)(void*);
-typedef void (*analyzer_mutex_lock_fn)(void*);
-typedef bool (*analyzer_mutex_trylock_fn)(void*);
-typedef void (*analyzer_mutex_unlock_fn)(void*);
-
+// Callbacks provided by the host environment (DynamoRIO or Test Harness)
 typedef struct {
-    analyzer_mutex_create_fn mutex_create;
-    analyzer_mutex_destroy_fn mutex_destroy;
-    analyzer_mutex_lock_fn mutex_lock;
-    analyzer_mutex_trylock_fn mutex_trylock;
-    analyzer_mutex_unlock_fn mutex_unlock;
+    // Called when a PC is retroactively or directly determined to be involved in IPC.
+    void (*mark_pc_ipc)(uintptr_t pc, bool is_push);
     
     // Called when retroactive sharing is detected to add counts to a thread's strict IPC metric.
     void (*add_strict_ipc)(uint8_t tid, uint32_t pushes, uint32_t pops);
     
     // Debug logging callback.
     void (*log_debug)(const char *msg);
+    
+    // Mutex abstraction for thread-safety across environments (DynamoRIO vs pthreads)
+    void* (*mutex_create)(void);
+    void (*mutex_lock)(void *mutex);
+    void (*mutex_unlock)(void *mutex);
+    void (*mutex_destroy)(void *mutex);
 } analyzer_callbacks_t;
 
 // Statistics collected by the analyzer internally.
@@ -43,7 +40,7 @@ typedef struct {
 } analyzer_stats_t;
 
 // Initialize the analyzer subsystem.
-void analyzer_init(analyzer_callbacks_t *cb);
+void analyzer_init(analyzer_callbacks_t cb);
 
 // Register a thread and its stack boundaries.
 void analyzer_register_thread(uint8_t tid, uintptr_t stack_base, uintptr_t stack_top);
@@ -51,29 +48,23 @@ void analyzer_register_thread(uint8_t tid, uintptr_t stack_base, uintptr_t stack
 // Unregister a thread.
 void analyzer_unregister_thread(uint8_t tid);
 
-// Add logical clock ticks
-void analyzer_add_logical_clock(uint8_t tid, uint32_t ticks);
+// Update a thread's logical clock
+void analyzer_update_clock(uint8_t tid, uint32_t ticks);
 
 // The core event handlers.
-void analyzer_on_push(uint8_t tid, uintptr_t addr, size_t size, uintptr_t pc, uint8_t ctx_hash);
-void analyzer_on_pop (uint8_t tid, uintptr_t addr, size_t size, uintptr_t pc, uint8_t ctx_hash);
+void analyzer_on_push(uint8_t tid, uintptr_t addr, size_t size, uintptr_t pc);
+void analyzer_on_pop (uint8_t tid, uintptr_t addr, size_t size, uintptr_t pc);
 void analyzer_on_ld  (uint8_t tid, uintptr_t addr, size_t size);
 void analyzer_on_st  (uint8_t tid, uintptr_t addr, size_t size);
 
 // Retrieve internal statistics.
 void analyzer_get_stats(analyzer_stats_t *out);
 
-// Retrieve PC tracking stats
-void analyzer_get_pc_stats(uint64_t* sum_possible_push, uint64_t* sum_possible_pop, uint64_t* hist_sum_push, uint64_t* hist_sum_pop, uint32_t* unique_pcs, uint32_t* unique_ipc_pcs, bool try_lock_only);
-
-bool analyzer_test_is_pc_ipc(uintptr_t pc);
+// Cleanup all resources (frees shadow memory and hash tables).
+void analyzer_cleanup(void);
 
 // Get the histogram array of size 2049
 const uint64_t* analyzer_get_histogram(void);
-
-// Cleanup all resources.
-void analyzer_drain_hanging_pushes(void);
-void analyzer_cleanup(void);
 
 #ifdef __cplusplus
 }

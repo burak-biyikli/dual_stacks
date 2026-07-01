@@ -16,9 +16,9 @@ def calculate_percentage(part, whole):
 
 def summarize_run(run_dir):
     print(f"Summarizing data from: {run_dir}")
-    print("=" * 120)
-    print(f"{'Benchmark Name':<25} {'Size':<10} {'LD%':<8} {'ST%':<8} {'PUSH%':<8} {'POP%':<8} {'Private%':<10} {'StrictIPC%':<12} {'PossIPC%':<10} {'PUSH/ST':<10} {'POP/LD':<10}")
-    print("-" * 120)
+    print("=" * 145)
+    print(f"{'Benchmark Name':<25} {'Size':<10} {'LD%':<8} {'ST%':<8} {'PUSH%':<8} {'POP%':<8} {'Private%':<10} {'StrictIPC%':<12} {'PossIPC(H)%':<13} {'PossIPC(NH)%':<14} {'PUSH/ST':<10} {'POP/LD':<10}")
+    print("-" * 145)
     
     # Sort subdirectories to have a consistent order
     bench_dirs = sorted([d for d in run_dir.iterdir() if d.is_dir()])
@@ -53,17 +53,20 @@ def summarize_run(run_dir):
         stack_tot = stack.get("total", 0)
         priv = stack.get("provably_private", 0)
         strict = stack.get("strictly_ipc", 0)
-        poss = stack.get("possibly_ipc", 0)
+        poss_nh = stack.get("possibly_ipc_non_hist", 0)
+        poss_h = stack.get("possibly_ipc_hist", 0)
         
         if mem_tot == 0:
             # Benchmark likely failed
-            print(f"{name:<25} {size:<10} {'Failed':<8} {'-':<8} {'-':<8} {'-':<8} {'-':<10} {'-':<12} {'-':<10} {'-':<10} {'-':<10}")
+            print(f"{name:<25} {size:<10} {'Failed':<8} {'-':<8} {'-':<8} {'-':<8} {'-':<10} {'-':<12} {'-':<13} {'-':<14} {'-':<10} {'-':<10}")
             continue
             
         # Mathematical Invariants
         try:
             assert stack_tot == push + pop, f"[{name}] Stack total ({stack_tot}) != pushes ({push}) + pops ({pop})"
-            assert stack_tot == priv + strict + poss, f"[{name}] Stack total ({stack_tot}) != priv ({priv}) + strict ({strict}) + poss ({poss})"
+            assert stack_tot == priv + strict + poss_nh, f"[{name}] Stack total ({stack_tot}) != priv ({priv}) + strict ({strict}) + poss_nh ({poss_nh})"
+            assert poss_nh >= poss_h, f"[{name}] Non-History IPC ({poss_nh}) < History IPC ({poss_h})"
+
             
             unique_pcs = data.get("unique_pcs", 0)
             unique_ipc_pcs = data.get("unique_ipc_pcs", 0)
@@ -87,12 +90,13 @@ def summarize_run(run_dir):
         
         priv_pct = calculate_percentage(priv, stack_tot)
         strict_pct = calculate_percentage(strict, stack_tot)
-        poss_pct = calculate_percentage(poss, stack_tot)
+        poss_nh_pct = calculate_percentage(poss_nh, stack_tot)
+        poss_h_pct = calculate_percentage(poss_h, stack_tot)
         
         push_st = calculate_percentage(push, st)
         pop_ld = calculate_percentage(pop, ld)
         
-        print(f"{name:<25} {size:<10} {ld_pct:<8} {st_pct:<8} {push_pct:<8} {pop_pct:<8} {priv_pct:<10} {strict_pct:<12} {poss_pct:<10} {push_st:<10} {pop_ld:<10}")
+        print(f"{name:<25} {size:<10} {ld_pct:<8} {st_pct:<8} {push_pct:<8} {pop_pct:<8} {priv_pct:<10} {strict_pct:<12} {poss_h_pct:<13} {poss_nh_pct:<14} {push_st:<10} {pop_ld:<10}")
 
 def main():
     parser = argparse.ArgumentParser(description="Summarize profiling run results")

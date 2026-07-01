@@ -18,7 +18,7 @@ gcc -O0 -g $ANALYZER_DIR/tests/test_long_lifetime.c -o $ANALYZER_DIR/tests/test_
 echo "Running test_private..."
 OUTPUT_PRIVATE=$($DRRUN -c $CLIENT -- $ANALYZER_DIR/tests/test_private 2>&1)
 echo "$OUTPUT_PRIVATE"
-if echo "$OUTPUT_PRIVATE" | grep -q "Strictly IPC (Instance Level): 0"; then
+if echo "$OUTPUT_PRIVATE" | grep -q -E "Strictly IPC \(Instance Level\): +0"; then
     echo "test_private PASSED (0 IPC detected)"
 else
     echo "test_private FAILED (IPC unexpectedly detected)"
@@ -28,7 +28,7 @@ fi
 echo "Running test_ipc..."
 OUTPUT_IPC=$($DRRUN -c $CLIENT -- $ANALYZER_DIR/tests/test_ipc 2>&1)
 echo "$OUTPUT_IPC"
-if echo "$OUTPUT_IPC" | grep -q -E "Strictly IPC \(Instance Level\): [1-9][0-9]*"; then
+if echo "$OUTPUT_IPC" | grep -q -E "Strictly IPC \(Instance Level\): +[1-9][0-9]*"; then
     echo "test_ipc PASSED (IPC successfully detected)"
 else
     echo "test_ipc FAILED (IPC not detected)"
