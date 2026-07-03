@@ -1,0 +1,5 @@
+Generate Time:       64.35209
+Build Time:          19.12121
+Graph has 1048576 nodes and 15699691 undirected edges for degree: 14
+
+[Trace Analyzer Script] Run Status: timed_out

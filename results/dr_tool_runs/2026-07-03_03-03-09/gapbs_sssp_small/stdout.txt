@@ -1,0 +1,7 @@
+Generate Time:       3.15474
+Build Time:          1.00599
+Graph has 32768 nodes and 441438 undirected edges for degree: 13
+Trial Time:          0.41462
+Average Time:        0.41462
+
+[Trace Analyzer Script] Run Status: finished
