@@ -248,6 +248,7 @@ static void dump_stats(bool abnormal_exit) {
     uint64_t total_stack = stats.total_push + stats.total_pop;
     
     dr_fprintf(STDERR, "=== Stack Privacy Analysis ===\n");
+    dr_fprintf(STDERR, "[APP: %s]\n", dr_get_application_name());
     dr_fprintf(STDERR, "Total Memory Operations: %llu\n", total_mem);
     dr_fprintf(STDERR, "  Loads:  %llu\n", stats.total_ld);
     dr_fprintf(STDERR, "  Stores: %llu\n", stats.total_st);
@@ -310,8 +311,44 @@ static dr_signal_action_t event_signal(void *drcontext, dr_siginfo_t *info) {
     return DR_SIGNAL_DELIVER;
 }
 
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+static void client_thread_func(void *param) {
+    const char *fifo_path = (const char *)param;
+    int fd = open(fifo_path, O_RDWR);
+    if (fd >= 0) {
+        char buf[1];
+        if (read(fd, buf, 1) > 0) {
+            if (!g_abnormal_exit_triggered) {
+                g_abnormal_exit_triggered = true;
+                dr_fprintf(STDERR, "Received timeout signal via FIFO. Dumping stats...\n");
+                dump_stats(true);
+                dr_abort_with_code(1);
+            }
+        }
+        close(fd);
+    }
+    dr_global_free((void*)fifo_path, strlen(fifo_path) + 1);
+}
+
 DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
     dr_set_client_name("DynamoRIO Stack Privacy Analyzer", "http://dynamorio.org/issues");
+    
+    const char *fifo_path = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-fifo_path") == 0 && i + 1 < argc) {
+            fifo_path = argv[i+1];
+            i++;
+        }
+    }
+    
+    if (fifo_path != NULL) {
+        char *path_copy = (char *)dr_global_alloc(strlen(fifo_path) + 1);
+        strcpy(path_copy, fifo_path);
+        dr_create_client_thread(client_thread_func, path_copy);
+    }
     
     drmgr_init();
     
