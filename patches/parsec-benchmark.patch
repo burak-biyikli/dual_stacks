@@ -1,0 +1,14 @@
+diff --git a/.gitignore b/.gitignore
+index d7b36c15..f38b6ba9 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -23,3 +23,9 @@ run
+ /bin/.#parsecmgmt.1.6
+ /toolkit/hpt/loggroup1.old/
+ /toolkit/hpt/loggroup2.old/
++
++# Build logs and test outputs
++/build_*.log
++/err_test.txt
++/out_test.txt
++
