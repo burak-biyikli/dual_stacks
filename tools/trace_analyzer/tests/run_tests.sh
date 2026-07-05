@@ -72,6 +72,8 @@ else
     cd "$SCRIPT_DIR"
     gcc -O0 -g -pthread test_private.c -o test_private 2>&1
     gcc -O0 -g -pthread test_ipc.c -o test_ipc 2>&1
+    gcc -O0 -g -pthread test_ipc_ghr.c -o test_ipc_ghr 2>&1
+    gcc -O0 -g -pthread test_stack_reuse.c -o test_stack_reuse 2>&1
     gcc -O0 -g test_short_lifetime.c -o test_short_lifetime 2>&1
     gcc -O0 -g test_long_lifetime.c -o test_long_lifetime 2>&1
     echo ""
@@ -93,6 +95,28 @@ else
         pass "test_ipc (IPC successfully detected)"
     else
         fail "test_ipc (expected Strictly IPC > 0)"
+        echo "$OUTPUT" | grep -E "Strictly IPC|Provably Private" | head -5
+    fi
+
+    # --- test_ipc_ghr: Verify GHR context bucket refinement reduces Possibly IPC false positives ---
+    echo "Running test_ipc_ghr..."
+    OUTPUT=$($DRRUN -c $CLIENT -- ./test_ipc_ghr 2>&1)
+    NON_HIST=$(echo "$OUTPUT" | grep -oP "Possibly IPC \(Non-History\): +\K[0-9]+")
+    HIST=$(echo "$OUTPUT" | grep -oP "Possibly IPC \(History-Based, [0-9]+ buckets\): +\K[0-9]+")
+    if [ -n "$NON_HIST" ] && [ -n "$HIST" ] && [ "$NON_HIST" -gt "$HIST" ]; then
+        pass "test_ipc_ghr (GHR refinement successfully verified: Non-History ($NON_HIST) > History-Based ($HIST))"
+    else
+        fail "test_ipc_ghr (expected Possibly IPC Non-History > History-Based)"
+        echo "$OUTPUT" | grep -E "Possibly IPC"
+    fi
+
+    # --- test_stack_reuse: Thread exit + stack address reuse should have 0 IPC ---
+    echo "Running test_stack_reuse..."
+    OUTPUT=$($DRRUN -c $CLIENT -- ./test_stack_reuse 2>&1)
+    if echo "$OUTPUT" | grep -q -E "Strictly IPC \(Instance Level\): +0"; then
+        pass "test_stack_reuse (0 IPC detected)"
+    else
+        fail "test_stack_reuse (expected Strictly IPC = 0)"
         echo "$OUTPUT" | grep -E "Strictly IPC|Provably Private" | head -5
     fi
 
@@ -139,6 +163,14 @@ else
     else
         fail "test_fuzzer_minimal_stress (expected IPC > 0 and >= 2 IPC PCs)"
         echo "$OUTPUT" | grep -E "Strictly IPC|Unique Raw Stack PCs" | head -5
+    fi
+
+    # --- Performance Scaling Sweep ---
+    echo "Running Performance Scaling Sweep..."
+    if "$SCRIPT_DIR/run_perf_scale.sh"; then
+        pass "Performance Scaling Sweep"
+    else
+        fail "Performance Scaling Sweep (execution error)"
     fi
 fi
 

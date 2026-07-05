@@ -28,6 +28,7 @@ target_link_libraries(test_fuzzer pthread)
 
 # Build DynamoRIO client
 add_library(analyzer SHARED dr_client.cpp analyzer.cpp)
+target_compile_definitions(analyzer PRIVATE BUILDING_DR_CLIENT)
 configure_DynamoRIO_client(analyzer)
 use_DynamoRIO_extension(analyzer drmgr)
 use_DynamoRIO_extension(analyzer drreg)

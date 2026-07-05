@@ -580,3 +580,34 @@ TEST_F(AnalyzerTest, RepeatedCleanup) {
     EXPECT_EQ(stats.total_push, 1u);
     EXPECT_EQ(stats.total_pop, 1u);
 }
+
+TEST_F(AnalyzerTest, AddressBoundaries) {
+    analyzer_register_thread(1, 0x1000, 0x2000);
+
+    // 1. Zero/Null address
+    analyzer_on_push(1, 0x0, 8, 0xAA, 0);
+    analyzer_on_st(1, 0x0, 8);
+    analyzer_on_pop(1, 0x0, 8, 0xBB, 0);
+
+    // 2. High 48-bit address limit
+    uintptr_t high_addr = 0xFFFFFFFFFFF0ULL;
+    analyzer_on_push(1, high_addr, 8, 0xCC, 0);
+    analyzer_on_st(1, high_addr, 8);
+    analyzer_on_pop(1, high_addr, 8, 0xDD, 0);
+
+    // 3. Wrapping address (crosses the 2GB page boundary)
+    // 2GB page boundary starts at 2GB (0x80000000).
+    // An 8-byte access at 0x7FFFFFFC crosses this boundary.
+    uintptr_t wrap_addr = 0x7FFFFFFCULL;
+    analyzer_on_push(1, wrap_addr, 8, 0xEE, 0);
+    analyzer_on_st(1, wrap_addr, 8);
+    analyzer_on_pop(1, wrap_addr, 8, 0xFF, 0);
+
+    // Verify stats are accumulated correctly and no crashes occurred
+    analyzer_stats_t stats;
+    analyzer_get_stats(&stats);
+    EXPECT_EQ(stats.total_push, 3u);
+    EXPECT_EQ(stats.total_pop, 3u);
+    EXPECT_EQ(stats.total_st, 3u);
+}
+

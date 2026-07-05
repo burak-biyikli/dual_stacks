@@ -7,7 +7,13 @@
 #include <atomic>
 #include <unordered_map>
 #include <vector>
-#include <cassert>
+#ifdef BUILDING_DR_CLIENT
+# include "dr_api.h"
+# define ANALYZER_ASSERT(x) DR_ASSERT(x)
+#else
+# include <cassert>
+# define ANALYZER_ASSERT(x) assert(x)
+#endif
 
 #define UNACCESSED 0x00
 #define SHARED_TAG 0x80 // MSB set
@@ -354,7 +360,7 @@ static void retroactive_ipc_and_drain_l2(uintptr_t curr_addr) {
 }
 
 void analyzer_on_push(uint8_t tid, uintptr_t addr, size_t size, uintptr_t pc, uint8_t ctx_hash) {
-    assert(size <= 256 && "Memory access size exceeds 1-byte offset capacity");
+    ANALYZER_ASSERT(size <= 256 && "Memory access size exceeds 1-byte offset capacity");
     stat_total_push.fetch_add(1, std::memory_order_relaxed);
     record_pc(pc, true, ctx_hash);
     
@@ -385,7 +391,7 @@ void analyzer_on_push(uint8_t tid, uintptr_t addr, size_t size, uintptr_t pc, ui
 }
 
 void analyzer_on_pop(uint8_t tid, uintptr_t addr, size_t size, uintptr_t pc, uint8_t ctx_hash) {
-    assert(size <= 256 && "Memory access size exceeds 1-byte offset capacity");
+    ANALYZER_ASSERT(size <= 256 && "Memory access size exceeds 1-byte offset capacity");
     stat_total_pop.fetch_add(1, std::memory_order_relaxed);
     record_pc(pc, false, ctx_hash);
     
