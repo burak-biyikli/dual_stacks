@@ -20,8 +20,25 @@ def summarize_run(run_dir):
     print(f"{'Benchmark(ProcessName)':<40} {'Size':<10} {'LD%':<8} {'ST%':<8} {'PUSH%':<8} {'POP%':<8} {'Private%':<10} {'StrictIPC%':<12} {'PossIPC(H)%':<13} {'PossIPC(NH)%':<14} {'PUSH/ST':<10} {'POP/LD':<10}")
     print("-" * 155)
     
-    # Sort subdirectories to have a consistent order
-    bench_dirs = sorted([d for d in run_dir.iterdir() if d.is_dir()])
+    # Sort subdirectories to have a consistent order (grouped by benchmark name, size ordered test -> small -> medium -> large -> native)
+    size_order = {
+        "test": 0,
+        "small": 1,
+        "medium": 2,
+        "large": 3,
+        "native": 4,
+    }
+    def get_sort_key(d):
+        name_parts = d.name.split('_')
+        if len(name_parts) >= 3:
+            size = name_parts[-1]
+            name = "_".join(name_parts[:-1])
+        else:
+            size = "unknown"
+            name = d.name
+        return (name, size_order.get(size, 999), size)
+
+    bench_dirs = sorted([d for d in run_dir.iterdir() if d.is_dir()], key=get_sort_key)
     
     for bench_dir in bench_dirs:
         json_path = bench_dir / "parsed_data.json"

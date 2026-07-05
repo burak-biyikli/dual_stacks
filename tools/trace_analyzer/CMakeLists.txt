@@ -13,10 +13,17 @@ if (NOT DynamoRIO_FOUND)
   message(FATAL_ERROR "DynamoRIO package required to build")
 endif()
 
-# Build standalone test harness
+# Find Google Test
+find_package(GTest REQUIRED)
+enable_testing()
+
+# Build GTest-based unit test harness
 add_executable(test_analyzer tests/test_analyzer.cpp analyzer.cpp)
+target_link_libraries(test_analyzer GTest::gtest GTest::gtest_main pthread)
+gtest_discover_tests(test_analyzer)
+
+# Build standalone integration stress test (run under DynamoRIO)
 add_executable(test_fuzzer tests/test_fuzzer_minimal_stress.cpp)
-target_link_libraries(test_analyzer pthread)
 target_link_libraries(test_fuzzer pthread)
 
 # Build DynamoRIO client

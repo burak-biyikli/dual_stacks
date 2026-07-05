@@ -1,25 +1,162 @@
 #!/bin/bash
-set -e
+# =================================================================
+# Trace Analyzer Test Runner
+#
+# Runs all unit and integration tests for the trace analyzer.
+# Reports pass/fail per test and prints a summary at the end.
+#
+# Usage:
+#   ./tests/run_tests.sh          # Run from trace_analyzer directory
+#
+# Prerequisites:
+#   - DynamoRIO built in ext/dynamorio/build
+#   - trace_analyzer built in tools/trace_analyzer/build
+# =================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 ANALYZER_DIR="$SCRIPT_DIR/.."
 PROJECT_DIR="$ANALYZER_DIR/../.."
 
+DRRUN="$PROJECT_DIR/ext/dynamorio/build/bin64/drrun"
+CLIENT="$ANALYZER_DIR/build/libanalyzer.so"
+
+PASSED=0
+FAILED=0
+FAILED_TESTS=""
+
+pass() {
+    echo "  PASSED: $1"
+    PASSED=$((PASSED + 1))
+}
+
+fail() {
+    echo "  FAILED: $1"
+    FAILED=$((FAILED + 1))
+    FAILED_TESTS="$FAILED_TESTS  - $1\n"
+}
+
+# =================================================================
+# Build
+# =================================================================
 echo "=== Building Analyzer and Tests ==="
 cd "$ANALYZER_DIR/build"
-make -j4
+if ! make -j$(nproc) 2>&1; then
+    echo "FATAL: Build failed!"
+    exit 1
+fi
+echo ""
 
-echo "=== Running Unit Tests ==="
-./test_analyzer
+# =================================================================
+# Unit Tests (GTest)
+# =================================================================
+echo "=== Running Unit Tests (GTest) ==="
+if ./test_analyzer --gtest_color=yes 2>&1; then
+    pass "Unit Tests (test_analyzer)"
+else
+    fail "Unit Tests (test_analyzer)"
+fi
+echo ""
 
-echo "=== Running Fuzzer Test ==="
-./test_fuzzer
+# =================================================================
+# Integration Tests (under DynamoRIO)
+# =================================================================
+echo "=== Running Integration Tests ==="
 
-echo "=== Running C Integration Tests ==="
-cd "$SCRIPT_DIR"
-for TEST in test_ipc test_private test_short_lifetime test_long_lifetime; do
-    echo "Running $TEST..."
-    $PROJECT_DIR/ext/dynamorio/build/bin64/drrun -c $ANALYZER_DIR/build/libanalyzer.so -- ./$TEST 2> >(grep -E 'Provably Private|Possibly IPC' >&2) >/dev/null
-done
+if [ ! -f "$DRRUN" ] || [ ! -f "$CLIENT" ]; then
+    echo "WARNING: DynamoRIO or client not found, skipping integration tests."
+    echo "  DRRUN=$DRRUN"
+    echo "  CLIENT=$CLIENT"
+else
+    # --- Compile test programs ---
+    echo "Compiling integration test programs..."
+    cd "$SCRIPT_DIR"
+    gcc -O0 -g -pthread test_private.c -o test_private 2>&1
+    gcc -O0 -g -pthread test_ipc.c -o test_ipc 2>&1
+    gcc -O0 -g test_short_lifetime.c -o test_short_lifetime 2>&1
+    gcc -O0 -g test_long_lifetime.c -o test_long_lifetime 2>&1
+    echo ""
 
-echo "=== All Tests Completed Successfully ==="
+    # --- test_private: All operations should be provably private ---
+    echo "Running test_private..."
+    OUTPUT=$($DRRUN -c $CLIENT -- ./test_private 2>&1)
+    if echo "$OUTPUT" | grep -q -E "Strictly IPC \(Instance Level\): +0"; then
+        pass "test_private (0 IPC detected)"
+    else
+        fail "test_private (expected Strictly IPC = 0)"
+        echo "$OUTPUT" | grep -E "Strictly IPC|Provably Private" | head -5
+    fi
+
+    # --- test_ipc: Should detect cross-thread IPC ---
+    echo "Running test_ipc..."
+    OUTPUT=$($DRRUN -c $CLIENT -- ./test_ipc 2>&1)
+    if echo "$OUTPUT" | grep -q -E "Strictly IPC \(Instance Level\): +[1-9][0-9]*"; then
+        pass "test_ipc (IPC successfully detected)"
+    else
+        fail "test_ipc (expected Strictly IPC > 0)"
+        echo "$OUTPUT" | grep -E "Strictly IPC|Provably Private" | head -5
+    fi
+
+    # --- test_short_lifetime: Should have histogram entries in low bins ---
+    echo "Running test_short_lifetime..."
+    OUTPUT=$($DRRUN -c $CLIENT -- ./test_short_lifetime 2>&1)
+    if echo "$OUTPUT" | grep -q "Stack Lifetime Histogram"; then
+        pass "test_short_lifetime (histogram present)"
+    else
+        fail "test_short_lifetime (no histogram output)"
+    fi
+
+    # --- test_long_lifetime: Should have entries in the overflow bin ---
+    echo "Running test_long_lifetime..."
+    OUTPUT=$($DRRUN -c $CLIENT -- ./test_long_lifetime 2>&1)
+    if echo "$OUTPUT" | grep -q "\[> 2047\]: [1-9]"; then
+        pass "test_long_lifetime (overflow bin populated)"
+    else
+        fail "test_long_lifetime (expected entries in [> 2047] bin)"
+        echo "$OUTPUT" | grep -E "\[> 2047\]|Histogram" | head -5
+    fi
+
+    # --- test_fuzzer_minimal_stress: Should detect IPC under heavy churn ---
+    echo "Running test_fuzzer_minimal_stress (this may take a moment)..."
+    OUTPUT=$($DRRUN -c $CLIENT -- "$ANALYZER_DIR/build/test_fuzzer" 2>&1)
+    FUZZER_OK=true
+
+    if echo "$OUTPUT" | grep -q -E "Strictly IPC \(Instance Level\): +[1-9][0-9]*"; then
+        : # IPC detected
+    else
+        FUZZER_OK=false
+    fi
+
+    # Check that at least 2 unique PCs have IPC (push PC + load/store PC)
+    IPC_PCS=$(echo "$OUTPUT" | grep -oP "Unique Raw Stack PCs with IPC: +\K[0-9]+" | head -1)
+    if [ -n "$IPC_PCS" ] && [ "$IPC_PCS" -ge 2 ] 2>/dev/null; then
+        : # At least 2 IPC PCs
+    else
+        FUZZER_OK=false
+    fi
+
+    if $FUZZER_OK; then
+        pass "test_fuzzer_minimal_stress (IPC detected, >= 2 IPC PCs)"
+    else
+        fail "test_fuzzer_minimal_stress (expected IPC > 0 and >= 2 IPC PCs)"
+        echo "$OUTPUT" | grep -E "Strictly IPC|Unique Raw Stack PCs" | head -5
+    fi
+fi
+
+echo ""
+
+# =================================================================
+# Summary
+# =================================================================
+TOTAL=$((PASSED + FAILED))
+echo "==========================================="
+echo "  Test Summary: $PASSED/$TOTAL passed"
+echo "==========================================="
+
+if [ $FAILED -gt 0 ]; then
+    echo "Failed tests:"
+    echo -e "$FAILED_TESTS"
+    exit 1
+fi
+
+echo "All tests passed!"
+exit 0
