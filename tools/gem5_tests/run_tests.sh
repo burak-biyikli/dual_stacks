@@ -1,6 +1,12 @@
 #!/bin/bash
 set -e
 
+# --- Argument Parsing ---
+VERBOSE=0
+if [[ "$1" == "-v" || "$1" == "--verbose" ]]; then
+    VERBOSE=1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 ROOT_DIR="$(realpath "$SCRIPT_DIR/../..")"
 EXT_DIR="$ROOT_DIR/ext"
@@ -9,10 +15,24 @@ GEM5_BIN="$GEM5_DIR/build/X86/gem5.opt"
 
 echo "=== Running gem5 Value Predictor Unit Tests ==="
 cd "$GEM5_DIR"
-scons build/X86/cpu/valuepred/memory_renaming.test.opt -j$(nproc) --linker=mold --ignore-style USE_CCACHE=1
+UNIT_BUILD_LOG="/tmp/gem5_unit_build.log"
+
+# Build Unit Tests quietly unless verbose
+if [ "$VERBOSE" -eq 1 ]; then
+    scons build/X86/cpu/valuepred/memory_renaming.test.opt -j$(nproc) --linker=mold --ignore-style USE_CCACHE=1
+else
+    if ! scons build/X86/cpu/valuepred/memory_renaming.test.opt -j$(nproc) --linker=mold --ignore-style USE_CCACHE=1 > "$UNIT_BUILD_LOG" 2>&1; then
+        echo "ERROR: Unit test build failed! See: $UNIT_BUILD_LOG"
+        cat "$UNIT_BUILD_LOG"
+        exit 1
+    fi
+fi
+
+# Let the gtest output print directly to the screen
 ./build/X86/cpu/valuepred/memory_renaming.test.opt
 
-echo "=== Running gem5 Microbenchmarks ==="
+
+echo -e "\n=== Running gem5 Microbenchmarks ==="
 cd "$SCRIPT_DIR"
 
 if [ ! -f "$GEM5_BIN" ]; then
@@ -20,35 +40,86 @@ if [ ! -f "$GEM5_BIN" ]; then
     exit 1
 fi
 
+FAILURES=0
+
 for test_dir in */; do
     if [ -d "$test_dir" ]; then
         test_name=$(basename "$test_dir")
         echo "--> Testing $test_name"
         
-        # Look for .S files to compile
         for asm_file in "$test_dir"*.S; do
             if [ -f "$asm_file" ]; then
                 bin_file="${asm_file%.S}"
-                echo "    Compiling $asm_file -> $bin_file"
-                gcc -nostdlib "$asm_file" -o "$bin_file"
-                
-                out_dir="$ROOT_DIR/results/tmp/m5out/$test_name"
+                out_dir="/tmp/gem5_dual_stacks_tests/$test_name"
                 mkdir -p "$out_dir"
-                echo "    Running gem5 simulation..."
-                # Run but allow failure so one failing test doesn't stop everything (unless we want it to)
+                
+                STDOUT_LOG="$out_dir/stdout.txt"
+                STDERR_LOG="$out_dir/stderr.txt"
+                
+                # Clear logs from previous runs
+                > "$STDOUT_LOG"
+                > "$STDERR_LOG"
+                
+                # 1. Compile
+                if ! gcc -nostdlib "$asm_file" -o "$bin_file" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"; then
+                    echo "    [FAIL] Compilation failed! See:"
+                    echo "    stderr: $STDERR_LOG"
+                    echo "    stdout: $STDOUT_LOG"
+                    FAILURES=$((FAILURES + 1))
+                    continue
+                fi
+                
+                trace_stock="$out_dir/trace_stock.txt"
+                trace_mr="$out_dir/trace_mr.txt"
+                clean_stock="$out_dir/trace_stock_clean.txt"
+                clean_mr="$out_dir/trace_mr_clean.txt"
+
+                # 2. Run Simulations
                 set +e
-                $GEM5_BIN --outdir="$out_dir" "$ROOT_DIR/configs/run_o3.py" "$bin_file"
-                sim_status=$?
+                "$GEM5_BIN" --debug-flags=Exec --debug-file=trace_stock.txt --outdir="$out_dir" "$ROOT_DIR/configs/run_o3_stock.py" "$bin_file" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
+                stock_status=$?
+                
+                "$GEM5_BIN" --debug-flags=Exec --debug-file=trace_mr.txt --outdir="$out_dir" "$ROOT_DIR/configs/run_o3_mr.py" "$bin_file" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
+                mr_status=$?
                 set -e
                 
-                if [ $sim_status -eq 0 ]; then
-                    echo "    Simulation completed successfully."
+                if [ $stock_status -ne 0 ] || [ $mr_status -ne 0 ]; then
+                    echo "    [FAIL] Simulation CRASHED (Stock exit: $stock_status, MR exit: $mr_status). See:"
+                    echo "    stderr: $STDERR_LOG"
+                    echo "    stdout: $STDOUT_LOG"
+                    FAILURES=$((FAILURES + 1))
+                    continue
+                fi
+                
+                # 3. Parse & Diff Traces
+                "$SCRIPT_DIR/parse_traces.py" "$trace_stock" "$clean_stock" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
+                "$SCRIPT_DIR/parse_traces.py" "$trace_mr" "$clean_mr" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
+                
+                if diff "$clean_stock" "$clean_mr" > "$out_dir/trace_diff.txt"; then
+                    if [ "$VERBOSE" -eq 1 ]; then
+                        echo "    [PASS] Traces match perfectly!"
+                    fi
                 else
-                    echo "    Simulation FAILED with exit code $sim_status (likely segfault)."
+                    echo "    [FAIL] Traces diverged! See:"
+                    echo "    stderr: $STDERR_LOG"
+                    echo "    stdout: $STDOUT_LOG"
+                    echo "    divergence diff: $out_dir/trace_diff.txt"
+                    FAILURES=$((FAILURES + 1))
                 fi
             fi
         done
     fi
 done
 
-echo "=== All gem5 tests completed ==="
+
+if [ $FAILURES -gt 0 ]; then
+    echo -e "\n\n==========================================="
+    echo "Test Summary: FAILED. $FAILURES test(s) failed."
+    echo "==========================================="
+    exit 1
+else
+    echo -e"\n\n==========================================="
+    echo "Test Summary: SUCCESS. All tests passed."
+    echo "==========================================="
+    exit 0
+fi

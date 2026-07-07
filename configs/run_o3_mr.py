@@ -3,6 +3,9 @@ from m5.objects import *
 import os
 import sys
 
+# Import Value Predictors
+from m5.objects.ValuePredictor import MemoryRenaming
+
 system = System()
 system.clk_domain = SrcClockDomain()
 system.clk_domain.clock = "1GHz"
@@ -12,6 +15,12 @@ system.mem_ranges = [AddrRange("512MiB")]
 
 # Use O3 CPU
 system.cpu = X86O3CPU()
+
+# Attach Memory Renaming logic
+system.cpu.valuePred = MemoryRenaming()
+
+# Cap execution to prevent unbounded traces
+system.cpu.max_insts_any_thread = 100000
 
 system.membus = SystemXBar()
 system.cpu.icache_port = system.membus.cpu_side_ports
