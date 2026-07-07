@@ -13,3 +13,6 @@
 [submodule "ext/xs-gem5"]
 	path = ext/xs-gem5
 	url = https://github.com/OpenXiangShan/GEM5
+[submodule "ext/gem5-resources"]
+	path = ext/gem5-resources
+	url = https://github.com/gem5/gem5-resources.git
