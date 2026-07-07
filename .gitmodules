@@ -10,3 +10,6 @@
 [submodule "ext/parsec-benchmark"]
 	path = ext/parsec-benchmark
 	url = https://github.com/cirosantilli/parsec-benchmark.git
+[submodule "ext/xs-gem5"]
+	path = ext/xs-gem5
+	url = https://github.com/OpenXiangShan/GEM5

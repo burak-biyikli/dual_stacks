@@ -37,14 +37,8 @@ else
     echo "Skipping DR+GAPBS test due to missing binaries."
 fi
 
-echo "=== 4. Testing gem5 SE mode ==="
-GEM5_BIN="$EXT_DIR/gem5/build/X86/gem5.opt"
-OUT_DIR="$ROOT_DIR/results/m5out_test"
-if [ -f "$GEM5_BIN" ]; then
-    $GEM5_BIN --outdir=$OUT_DIR $EXT_DIR/gem5/configs/learning_gem5/part1/simple.py
-else
-    echo "gem5 binary not found! Did it build successfully?"
-fi
+echo "=== 4. Running gem5 Unit and Integration Tests ==="
+"$ROOT_DIR/tools/gem5_tests/run_tests.sh"
 
 echo "=== 5. Testing PARSEC (Blackscholes) ==="
 # Build blackscholes

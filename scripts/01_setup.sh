@@ -25,8 +25,13 @@ EXT_DIR="$ROOT_DIR/ext"
 cd "$ROOT_DIR"
 
 echo "=== 1. Initializing submodules ==="
-# Pull the submodules listed in .gitmodules
-git submodule update --init --recursive
+# Pull the submodules listed in .gitmodules (excluding ext/xs-gem5)
+git submodule update --init --recursive -- ':!ext/xs-gem5'
+
+echo "=== 1.5. Cloning gem5-resources ==="
+if [ ! -d "$EXT_DIR/gem5-resources" ]; then
+    git clone https://github.com/gem5/gem5-resources.git "$EXT_DIR/gem5-resources"
+fi
 
 echo "=== 2. Applying Patches ==="
 ./scripts/00_patch_manager.sh apply

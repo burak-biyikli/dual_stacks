@@ -1,0 +1,559 @@
+diff --git a/src/cpu/o3/BaseO3CPU.py b/src/cpu/o3/BaseO3CPU.py
+index 3c477c115b..8fe1e49a85 100644
+--- a/src/cpu/o3/BaseO3CPU.py
++++ b/src/cpu/o3/BaseO3CPU.py
+@@ -43,6 +43,7 @@ from m5.objects.BaseCPU import BaseCPU
+ 
+ # from m5.objects.O3Checker import O3Checker
+ from m5.objects.BranchPredictor import *
++from m5.objects.ValuePredictor import *
+ from m5.objects.FUPool import *
+ from m5.objects.IndexingPolicies import *
+ from m5.objects.IQUnit import *
+@@ -205,6 +206,7 @@ class BaseO3CPU(BaseCPU):
+         ),
+         "Branch Predictor",
+     )
++    valuePred = Param.ValuePredictor(NULL, "valuepred unit")
+     needsTSO = Param.Bool(False, "Enable TSO Memory model")
+ 
+     recvRespThrottling = Param.Bool(
+diff --git a/src/cpu/o3/comm.hh b/src/cpu/o3/comm.hh
+index 192f73da2e..8bce754d46 100644
+--- a/src/cpu/o3/comm.hh
++++ b/src/cpu/o3/comm.hh
+@@ -67,6 +67,9 @@ struct FetchStruct
+     Fault fetchFault;
+     InstSeqNum fetchFaultSN;
+     bool clearFetchFault;
++
++    FetchStruct();
++    ~FetchStruct();
+ };
+ 
+ /** Struct that defines the information passed from decode to rename. */
+@@ -75,6 +78,9 @@ struct DecodeStruct
+     int size;
+ 
+     DynInstPtr insts[MaxWidth];
++
++    DecodeStruct();
++    ~DecodeStruct();
+ };
+ 
+ /** Struct that defines the information passed from rename to IEW. */
+@@ -83,6 +89,9 @@ struct RenameStruct
+     int size;
+ 
+     DynInstPtr insts[MaxWidth];
++
++    RenameStruct();
++    ~RenameStruct();
+ };
+ 
+ /** Struct that defines the information passed from IEW to commit. */
+@@ -100,6 +109,10 @@ struct IEWStruct
+     bool branchMispredict[MaxThreads];
+     bool branchTaken[MaxThreads];
+     bool includeSquashInst[MaxThreads];
++    bool valuePredictionError[MaxThreads];
++
++    IEWStruct();
++    ~IEWStruct();
+ };
+ 
+ struct IssueStruct
+@@ -107,6 +120,9 @@ struct IssueStruct
+     int size;
+ 
+     DynInstPtr insts[MaxWidth];
++
++    IssueStruct();
++    ~IssueStruct();
+ };
+ 
+ /** Struct that defines all backwards communication. */
+diff --git a/src/cpu/o3/commit.cc b/src/cpu/o3/commit.cc
+index 405ea09d64..8a204a7fc4 100644
+--- a/src/cpu/o3/commit.cc
++++ b/src/cpu/o3/commit.cc
+@@ -63,6 +63,7 @@
+ #include "debug/ExecFaulting.hh"
+ #include "debug/HtmCpu.hh"
+ #include "params/BaseO3CPU.hh"
++#include "cpu/valuepred/memory_renaming.hh"
+ #include "sim/faults.hh"
+ #include "sim/full_system.hh"
+ 
+@@ -116,7 +117,8 @@ Commit::Commit(CPU *_cpu, const BaseO3CPUParams &params)
+       trapLatency(params.trapLatency),
+       canHandleInterrupts(true),
+       avoidQuiesceLiveLock(false),
+-      stats(_cpu, this)
++      stats(_cpu, this),
++      valuePred(params.valuePred)
+ {
+     if (commitWidth > MaxWidth)
+         fatal("commitWidth (%d) is larger than compiled limit (%d),\n"
+@@ -1037,6 +1039,30 @@ Commit::commitInsts()
+                 // Keep track of the last sequence number commited
+                 lastCommitedSeqNum[tid] = head_inst->seqNum;
+ 
++                // Memory Renaming hooks
++                if (valuePred) {
++                    if (head_inst->isStore() && !head_inst->isSquashed()) {
++                        auto *mr = dynamic_cast<valuepred::MemoryRenaming*>(valuePred);
++                        if (mr) {
++                            mr->commitStore(head_inst->pcState().instAddr(), head_inst->seqNum);
++                        }
++                    } else if (head_inst->canLVP() && !head_inst->isSquashed() && (head_inst->getFault() == NoFault)) {
++                        valuepred::VPUpdateInfo updateInfo;
++                        updateInfo.pc = head_inst->pcState().instAddr();
++                        updateInfo.seqNo = head_inst->seqNum;
++                        updateInfo.tid = tid;
++                        updateInfo.actualValue = head_inst->actualValue;
++                        if (head_inst->hasProducerStorePC()) {
++                            updateInfo.emplaceExt<valuepred::ProducerInfoExt>(
++                                head_inst->producerStorePC(),
++                                head_inst->producerStoreSeqNum()
++                            );
++                        }
++                        valuepred::VPFeedback feedback;
++                        valuePred->update(updateInfo, head_inst->vpRecord.get(), feedback);
++                    }
++                }
++
+                 // If this is an instruction that doesn't play nicely with
+                 // others squash everything and restart fetch
+                 if (head_inst->isSquashAfter())
+diff --git a/src/cpu/o3/commit.hh b/src/cpu/o3/commit.hh
+index 5f978c8c5d..febda9f3fc 100644
+--- a/src/cpu/o3/commit.hh
++++ b/src/cpu/o3/commit.hh
+@@ -52,6 +52,7 @@
+ #include "cpu/o3/limits.hh"
+ #include "cpu/o3/rename_map.hh"
+ #include "cpu/o3/rob.hh"
++#include "cpu/valuepred/valuepred_unit.hh"
+ #include "cpu/timebuf.hh"
+ #include "enums/CommitPolicy.hh"
+ #include "sim/probe/probe.hh"
+@@ -446,6 +447,8 @@ class Commit
+     /** Rename map interface. */
+     UnifiedRenameMap *renameMap[MaxThreads];
+ 
++    valuepred::VPUnit *valuePred;
++
+     /** True if last committed microop can be followed by an interrupt */
+     bool canHandleInterrupts;
+ 
+diff --git a/src/cpu/o3/cpu.cc b/src/cpu/o3/cpu.cc
+index ad539e7948..d7cc4998f1 100644
+--- a/src/cpu/o3/cpu.cc
++++ b/src/cpu/o3/cpu.cc
+@@ -61,6 +61,7 @@
+ #include "sim/process.hh"
+ #include "sim/stat_control.hh"
+ #include "sim/system.hh"
++#include "cpu/valuepred/memory_renaming.hh"
+ 
+ namespace gem5
+ {
+@@ -113,8 +114,16 @@ CPU::CPU(const BaseO3CPUParams &params)
+       globalFTSeqNum(1),
+       system(params.system),
+       lastRunningCycle(curCycle()),
+-      cpuStats(this)
++      cpuStats(this),
++      valuePred(params.valuePred)
+ {
++    if (valuePred) {
++        auto *mr = dynamic_cast<valuepred::MemoryRenaming*>(valuePred);
++        if (mr) {
++            mr->setCPU(this);
++        }
++    }
++
+     fatal_if(FullSystem && params.numThreads > 1,
+             "SMT is not supported in O3 in full system mode currently.");
+ 
+@@ -1503,5 +1512,33 @@ CPU::htmSendAbortSignal(ThreadID tid, uint64_t htm_uid,
+     }
+ }
+ 
++FetchStruct::FetchStruct() : size(0), fetchFault(nullptr), fetchFaultSN(0), clearFetchFault(false) {}
++FetchStruct::~FetchStruct() {}
++
++DecodeStruct::DecodeStruct() : size(0) {}
++DecodeStruct::~DecodeStruct() {}
++
++RenameStruct::RenameStruct() : size(0) {}
++RenameStruct::~RenameStruct() {}
++
++IEWStruct::IEWStruct() : size(0)
++{
++    for (int i = 0; i < MaxThreads; i++) {
++        mispredictInst[i] = nullptr;
++        mispredPC[i] = 0;
++        squashedSeqNum[i] = 0;
++        pc[i] = nullptr;
++        squash[i] = false;
++        branchMispredict[i] = false;
++        branchTaken[i] = false;
++        includeSquashInst[i] = false;
++        valuePredictionError[i] = false;
++    }
++}
++IEWStruct::~IEWStruct() {}
++
++IssueStruct::IssueStruct() : size(0) {}
++IssueStruct::~IssueStruct() {}
++
+ } // namespace o3
+ } // namespace gem5
+diff --git a/src/cpu/o3/cpu.hh b/src/cpu/o3/cpu.hh
+index faa31d6c1c..5231b711c2 100644
+--- a/src/cpu/o3/cpu.hh
++++ b/src/cpu/o3/cpu.hh
+@@ -68,6 +68,7 @@
+ #include "cpu/o3/rob.hh"
+ #include "cpu/o3/scoreboard.hh"
+ #include "cpu/o3/thread_state.hh"
++#include "cpu/valuepred/valuepred_unit.hh"
+ #include "cpu/simple_thread.hh"
+ #include "cpu/timebuf.hh"
+ #include "params/BaseO3CPU.hh"
+@@ -384,6 +385,10 @@ class CPU : public BaseCPU
+     /** Debug function to print all instructions on the list. */
+     void dumpInsts();
+ 
++    valuepred::VPUnit *valuePred;
++    bool isValuePredictorEnabled() const { return valuePred != nullptr; }
++    valuepred::VPUnit *getValuePredictor() const { return valuePred; }
++
+   public:
+ #ifndef NDEBUG
+     /** Count of total number of dynamic instructions in flight. */
+@@ -463,6 +468,7 @@ class CPU : public BaseCPU
+     std::vector<BaseISA *> isa;
+ 
+   public:
++    Scoreboard *getScoreboard() { return &scoreboard; }
+     /** Enum to give each stage a specific index, so when calling
+      *  activateStage() or deactivateStage(), they can specify which stage
+      *  is being activated/deactivated.
+diff --git a/src/cpu/o3/dyn_inst.hh b/src/cpu/o3/dyn_inst.hh
+index f0c14fb177..d2474e4868 100644
+--- a/src/cpu/o3/dyn_inst.hh
++++ b/src/cpu/o3/dyn_inst.hh
+@@ -58,6 +58,7 @@
+ #include "cpu/o3/cpu.hh"
+ #include "cpu/o3/dyn_inst_ptr.hh"
+ #include "cpu/o3/lsq_unit.hh"
++#include "cpu/valuepred/valuepred_metadata.hh"
+ #include "cpu/op_class.hh"
+ #include "cpu/reg_class.hh"
+ #include "cpu/static_inst.hh"
+@@ -1204,6 +1205,32 @@ class DynInst : public ExecContext, public RefCounted
+         cpu->setReg(reg, val, threadNumber);
+         setResult(reg->regClass(), val);
+     }
++
++  private:
++    bool _hasProducerStorePC = false;
++    Addr _producerStorePC = 0;
++    InstSeqNum _producerStoreSeqNum = 0;
++
++  public:
++    void setProducerStorePC(Addr pc) { _hasProducerStorePC = true; _producerStorePC = pc; }
++    bool hasProducerStorePC() const { return _hasProducerStorePC; }
++    Addr producerStorePC() const { return _producerStorePC; }
++    void clearProducerStorePC() { _hasProducerStorePC = false; _producerStorePC = 0; }
++
++    void setProducerStoreSeqNum(InstSeqNum seqNum) { _producerStoreSeqNum = seqNum; }
++    InstSeqNum producerStoreSeqNum() const { return _producerStoreSeqNum; }
++
++    valuepred::VPResult vpResult = {false, 0xdeadbeefULL};
++    std::unique_ptr<valuepred::VPPredictionRecord> vpRecord = nullptr;
++    bool vpApplied = false;
++
++    RegVal actualValue = 0xdeadbeefULL;
++    bool vpMisprediction = false;
++    bool vpSupported = false;
++
++    bool canLVP() {
++        return isLoad() && !isVector();
++    }
+ };
+ 
+ } // namespace o3
+diff --git a/src/cpu/o3/iew.cc b/src/cpu/o3/iew.cc
+index d5be814468..46ebfb181a 100644
+--- a/src/cpu/o3/iew.cc
++++ b/src/cpu/o3/iew.cc
+@@ -88,7 +88,8 @@ IEW::IEW(CPU *_cpu, const BaseO3CPUParams &params)
+       wbCycle(0),
+       wbWidth(params.wbWidth),
+       numThreads(params.numThreads),
+-      iewStats(cpu)
++      iewStats(cpu),
++      valuePred(params.valuePred)
+ {
+     if (dispatchWidth > MaxWidth)
+         fatal("dispatchWidth (%d) is larger than compiled limit (%d),\n"
+@@ -297,6 +298,7 @@ IEW::clearStates(ThreadID tid)
+         iew_struct.branchMispredict[tid] = false;
+         iew_struct.branchTaken[tid] = false;
+         iew_struct.includeSquashInst[tid] = false;
++        iew_struct.valuePredictionError[tid] = false;
+     }
+ 
+     // Clear out any of this thread's instructions being sent from
+@@ -519,6 +521,51 @@ IEW::squashDueToMemOrder(const DynInstPtr& inst, ThreadID tid)
+     }
+ }
+ 
++void
++IEW::squashDueToValuePrediction(const DynInstPtr &inst, ThreadID tid)
++{
++    DPRINTF(IEW, "[tid:%i] value prediction error, squashing violator and younger "
++            "insts, PC: %s [sn:%llu].\n",
++            tid, inst->pcState(), inst->seqNum);
++    if (!toCommit->squash[tid] || inst->seqNum < toCommit->squashedSeqNum[tid]) {
++        toCommit->squash[tid] = true;
++
++        toCommit->valuePredictionError[tid] = true;
++        toCommit->squashedSeqNum[tid] = inst->seqNum;
++        set(toCommit->pc[tid], inst->pcState());
++
++        // advance pc to next instruction
++        inst->staticInst->advancePC(*toCommit->pc[tid]);
++
++        toCommit->mispredictInst[tid] = nullptr;
++
++        // Even speculatively executed value prediction instructions cannot
++        // be squashed after obtaining a correct result.
++        toCommit->includeSquashInst[tid] = false;
++
++        wroteToTimeBuffer = true;
++    }
++
++    toRename->iewBlock[tid] = true;
++}
++
++void
++IEW::lvpWakeDependents(const DynInstPtr &inst)
++{
++    assert(inst->numDestRegs() == 1);
++    for (int i = 0; i < inst->numDestRegs(); i++) {
++        auto dest = inst->renamedDestIdx(i);
++        if (dest->isFixedMapping()) {
++            continue;
++        }
++
++        scoreboard->setReg(dest);
++
++        DPRINTF(IEW, "[sn:%llu] vp set scoreboard to true\n", inst->seqNum);
++    }
++    instQueue.wakeDependents(inst);
++}
++
+ void
+ IEW::block(ThreadID tid)
+ {
+@@ -1014,6 +1061,10 @@ IEW::dispatchInsts(ThreadID tid)
+             // memory access.
+             ldstQueue.insertLoad(inst);
+ 
++            if (valuePred && inst->vpSupported && inst->vpResult.speculative) {
++                lvpWakeDependents(inst);
++            }
++
+             ++iewStats.dispLoadInsts;
+ 
+             add_to_iq = true;
+@@ -1337,6 +1388,9 @@ IEW::executeInsts()
+                 squashDueToMemOrder(violator, tid);
+ 
+                 ++iewStats.memOrderViolationEvents;
++            } else if (inst->vpMisprediction) {
++                fetchRedirect[tid] = true;
++                squashDueToValuePrediction(inst, tid);
+             }
+         } else {
+             // Reset any state associated with redirects that will not
+@@ -1414,6 +1468,10 @@ IEW::writebackInsts()
+                             inst->renamedDestIdx(i)->index(),
+                             inst->renamedDestIdx(i)->className());
+                     scoreboard->setReg(inst->renamedDestIdx(i));
++                    if (valuePred) {
++                        RegVal val = cpu->getReg(inst->renamedDestIdx(i), inst->threadNumber);
++                        valuePred->writebackReg(inst->renamedDestIdx(i), val);
++                    }
+                 }
+             }
+ 
+diff --git a/src/cpu/o3/iew.hh b/src/cpu/o3/iew.hh
+index c62a3dc835..f1027fe5b9 100644
+--- a/src/cpu/o3/iew.hh
++++ b/src/cpu/o3/iew.hh
+@@ -51,6 +51,7 @@
+ #include "cpu/o3/limits.hh"
+ #include "cpu/o3/lsq.hh"
+ #include "cpu/o3/scoreboard.hh"
++#include "cpu/valuepred/valuepred_unit.hh"
+ #include "cpu/timebuf.hh"
+ #include "debug/IEW.hh"
+ #include "sim/probe/probe.hh"
+@@ -250,6 +251,8 @@ class IEW
+      * violation.
+      */
+     void squashDueToMemOrder(const DynInstPtr &inst, ThreadID tid);
++    void squashDueToValuePrediction(const DynInstPtr &inst, ThreadID tid);
++    void lvpWakeDependents(const DynInstPtr &inst);
+ 
+     /** Sets Dispatch to blocked, and signals back to other stages to block. */
+     void block(ThreadID tid);
+@@ -342,6 +345,8 @@ class IEW
+     /** Scoreboard pointer. */
+     Scoreboard* scoreboard;
+ 
++    valuepred::VPUnit *valuePred;
++
+   private:
+     /** CPU pointer. */
+     CPU *cpu;
+diff --git a/src/cpu/o3/lsq_unit.cc b/src/cpu/o3/lsq_unit.cc
+index 67ae69237e..ece3666a60 100644
+--- a/src/cpu/o3/lsq_unit.cc
++++ b/src/cpu/o3/lsq_unit.cc
+@@ -47,6 +47,7 @@
+ #include "cpu/o3/dyn_inst.hh"
+ #include "cpu/o3/limits.hh"
+ #include "cpu/o3/lsq.hh"
++#include "cpu/valuepred/memory_renaming.hh"
+ #include "debug/Activity.hh"
+ #include "debug/HtmCpu.hh"
+ #include "debug/IEW.hh"
+@@ -1114,6 +1115,23 @@ LSQUnit::writeback(const DynInstPtr &inst, PacketPtr pkt)
+         if (inst->fault == NoFault) {
+             // Complete access to copy data to proper place.
+             inst->completeAcc(pkt);
++
++            if (cpu->valuePred) {
++                auto *mr = dynamic_cast<valuepred::MemoryRenaming*>(cpu->valuePred);
++                if (mr) {
++                    mr->completeLoadLSU(inst);
++                }
++            }
++
++            if (inst->canLVP() && inst->getFault() == NoFault) {
++                RegVal real_val = cpu->getReg(inst->renamedDestIdx(0), inst->threadNumber);
++                inst->actualValue = real_val;
++                if (inst->vpResult.speculative) {
++                    if (real_val != inst->vpResult.value) {
++                        inst->vpMisprediction = true;
++                    }
++                }
++            }
+         } else {
+             // If the instruction has an outstanding fault, we cannot complete
+             // the access as this discards the current fault.
+@@ -1547,6 +1565,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
+ 
+                 // Don't need to do anything special for split loads.
+                 ++stats.forwLoads;
++                load_inst->setProducerStorePC(store_it->instruction()->pcState().instAddr());
++                load_inst->setProducerStoreSeqNum(store_it->instruction()->seqNum);
+ 
+                 return NoFault;
+             } else if (
+diff --git a/src/cpu/o3/rename.cc b/src/cpu/o3/rename.cc
+index f783e0baad..c99b6b3058 100644
+--- a/src/cpu/o3/rename.cc
++++ b/src/cpu/o3/rename.cc
+@@ -46,6 +46,7 @@
+ #include "cpu/o3/cpu.hh"
+ #include "cpu/o3/dyn_inst.hh"
+ #include "cpu/o3/limits.hh"
++#include "cpu/valuepred/memory_renaming.hh"
+ #include "cpu/reg_class.hh"
+ #include "debug/Activity.hh"
+ #include "debug/Rename.hh"
+@@ -86,7 +87,8 @@ Rename::Rename(CPU *_cpu, const BaseO3CPUParams &params)
+       commitToRenameDelay(params.commitToRenameDelay),
+       renameWidth(params.renameWidth),
+       numThreads(params.numThreads),
+-      stats(_cpu)
++      stats(_cpu),
++      valuePred(params.valuePred)
+ {
+     if (renameWidth > MaxWidth)
+         fatal("renameWidth (%d) is larger than compiled limit (%d),\n"
+@@ -375,6 +377,10 @@ Rename::squash(const InstSeqNum &squash_seq_num, ThreadID tid)
+     DPRINTF(Rename, "[tid:%i] [squash sn:%llu] Squashing instructions.\n",
+         tid,squash_seq_num);
+ 
++    if (valuePred) {
++        valuePred->squash(tid, squash_seq_num);
++    }
++
+     // Clear the stall signal if rename was blocked or unblocking before.
+     // If it still needs to block, the blocking should happen the next
+     // cycle and there should be space to hold everything due to the squash.
+@@ -745,6 +751,21 @@ Rename::renameInsts(ThreadID tid)
+ 
+         renameDestRegs(inst, inst->threadNumber);
+ 
++        if (valuePred) {
++            auto *mr = dynamic_cast<valuepred::MemoryRenaming*>(valuePred);
++            if (mr) {
++                if (inst->isStore()) {
++                    if (inst->numSrcRegs() > 0) {
++                        mr->renameStore(inst, inst->renamedSrcIdx(0));
++                    }
++                } else if (inst->isLoad()) {
++                    if (inst->numDestRegs() > 0) {
++                        mr->renameLoad(inst, inst->renamedDestIdx(0));
++                    }
++                }
++            }
++        }
++
+         if (inst->isAtomic() || inst->isStore()) {
+             storesInProgress[tid]++;
+         } else if (inst->isLoad()) {
+diff --git a/src/cpu/o3/rename.hh b/src/cpu/o3/rename.hh
+index f17212990d..7ef2817807 100644
+--- a/src/cpu/o3/rename.hh
++++ b/src/cpu/o3/rename.hh
+@@ -50,6 +50,7 @@
+ #include "cpu/o3/commit.hh"
+ #include "cpu/o3/dyn_inst_ptr.hh"
+ #include "cpu/o3/free_list.hh"
++#include "cpu/valuepred/valuepred_unit.hh"
+ #include "cpu/o3/iew.hh"
+ #include "cpu/o3/limits.hh"
+ #include "cpu/timebuf.hh"
+@@ -372,6 +373,8 @@ class Rename
+     /** Pointer to the scoreboard. */
+     Scoreboard *scoreboard;
+ 
++    valuepred::VPUnit *valuePred;
++
+     /** Count of instructions in progress that have been sent off to the IQ
+      * and ROB, but are not yet included in their occupancy counts.
+      */
+diff --git a/src/cpu/timebuf.hh b/src/cpu/timebuf.hh
+index 9810286c05..1d2713e0f3 100644
+--- a/src/cpu/timebuf.hh
++++ b/src/cpu/timebuf.hh
+@@ -146,7 +146,7 @@ class TimeBuffer
+         for (unsigned i = 0; i < size; i++) {
+             index[i] = ptr;
+             std::memset(ptr, 0, sizeof(T));
+-            new (ptr) T;
++            new (ptr) T();
+             ptr += sizeof(T);
+         }
+ 
