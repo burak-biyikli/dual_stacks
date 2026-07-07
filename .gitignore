@@ -6,7 +6,6 @@ ext/*/m5out/
 # gem5 output
 m5out/
 results/tmp/
-results/m5out_test/
 
 # Python caching
 __pycache__/
@@ -16,3 +15,13 @@ __pycache__/
 .vscode/
 .idea/
 results/dr_tool_runs/
+
+# gem5 test executables (compiled binaries)
+tools/gem5_tests/*/*
+!tools/gem5_tests/*/*.S
+!tools/gem5_tests/*/*.c
+!tools/gem5_tests/*/*.h
+!tools/gem5_tests/*/*.py
+!tools/gem5_tests/*/*.sh
+!tools/gem5_tests/*/*.md
+!tools/gem5_tests/*/*.txt
