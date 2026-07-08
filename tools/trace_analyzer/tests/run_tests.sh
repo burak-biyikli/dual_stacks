@@ -174,21 +174,19 @@ else
     fi
 fi
 
-echo ""
-
 # =================================================================
 # Summary
 # =================================================================
 TOTAL=$((PASSED + FAILED))
-echo "==========================================="
-echo "  Test Summary: $PASSED/$TOTAL passed"
-echo "==========================================="
 
 if [ $FAILED -gt 0 ]; then
-    echo "Failed tests:"
-    echo -e "$FAILED_TESTS"
+    echo -e "\n\n==========================================="
+    echo "Test Summary: FAILED. $FAILED test(s) failed."
+    echo "==========================================="
     exit 1
+else
+    echo -e "\n\n==========================================="
+    echo "Test Summary: SUCCESS. $PASSED/$TOTAL passed."
+    echo "==========================================="
+    exit 0
 fi
-
-echo "All tests passed!"
-exit 0
