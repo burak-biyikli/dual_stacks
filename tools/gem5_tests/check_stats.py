@@ -40,9 +40,9 @@ if mode == "stock":
     print("    [PASS] Stock stats are clean (all 0 or missing).")
 
 elif mode == "mr":
-    if test_name == "no_forwarding":
+    if test_name in ["no_forwarding_dependency", "no_forwarding_size" ]:
         if stats["VPpredicted"] != 0:
-            print(f"    [FAIL] no_forwarding expected 0 VPpredicted, got {stats['VPpredicted']}")
+            print(f"    [FAIL] {test_name} expected 0 VPpredicted, got {stats['VPpredicted']}")
             sys.exit(1)
         print(f"    [PASS] MR mode on no_forwarding correctly avoided prediction.")
     else:

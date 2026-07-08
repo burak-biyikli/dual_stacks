@@ -19,6 +19,18 @@ system.cpu = X86O3CPU()
 # Attach Memory Renaming logic
 system.cpu.valuePred = MemoryRenaming()
 
+# --- Memory Renaming Configuration Stubs ---
+# You can override the default predictor parameters here:
+# system.cpu.valuePred.ways = 4
+# system.cpu.valuePred.tagWidth = 16
+# system.cpu.valuePred.logESTBEntrys = 10
+# system.cpu.valuePred.logMaxConfidence = 2
+# system.cpu.valuePred.predictionThreshold = 3
+# system.cpu.valuePred.demotionPenalty = 4
+# system.cpu.valuePred.mrtQueueCapacity = 8
+# system.cpu.valuePred.enableDynamic = True
+# system.cpu.valuePred.enableStatic = True
+
 # Cap execution to prevent unbounded traces
 system.cpu.max_insts_any_thread = 100000
 

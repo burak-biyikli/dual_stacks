@@ -7,30 +7,40 @@ if [[ "$1" == "-v" || "$1" == "--verbose" ]]; then
     VERBOSE=1
 fi
 
+set -u
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 ROOT_DIR="$(realpath "$SCRIPT_DIR/../..")"
 EXT_DIR="$ROOT_DIR/ext"
 GEM5_DIR="$EXT_DIR/gem5"
 GEM5_BIN="$GEM5_DIR/build/X86/gem5.opt"
 
-echo "=== Running gem5 Value Predictor Unit Tests ==="
-cd "$GEM5_DIR"
-UNIT_BUILD_LOG="/tmp/gem5_unit_build.log"
 
-# Build Unit Tests quietly unless verbose
+cd "$GEM5_DIR"
+BUILD_LOG="/tmp/gem5_build.log"
+
+echo -e "\n=== Rebuilding gem5 and unit tests==="
+
+# Define both targets
+TARGETS="build/X86/cpu/valuepred/memory_renaming.test.opt build/X86/gem5.opt"
+
+# Build all targets quietly unless verbose
 if [ "$VERBOSE" -eq 1 ]; then
-    scons build/X86/cpu/valuepred/memory_renaming.test.opt -j$(nproc) --linker=mold --ignore-style USE_CCACHE=1
+    scons $TARGETS -j$(nproc) --linker=mold --ignore-style USE_CCACHE=1
 else
-    if ! scons build/X86/cpu/valuepred/memory_renaming.test.opt -j$(nproc) --linker=mold --ignore-style USE_CCACHE=1 > "$UNIT_BUILD_LOG" 2>&1; then
-        echo "ERROR: Unit test build failed! See: $UNIT_BUILD_LOG"
-        cat "$UNIT_BUILD_LOG"
+    if ! scons $TARGETS -j$(nproc) --linker=mold --ignore-style USE_CCACHE=1 > "$BUILD_LOG" 2>&1; then
+        echo "ERROR: gem5 build failed! See: $BUILD_LOG"
+        cat "$BUILD_LOG"
         exit 1
+    else
+        echo "Build complete"
     fi
 fi
 
+echo -e "\n=== Running gem5 Value Predictor Unit Tests ==="
+
 # Let the gtest output print directly to the screen
 ./build/X86/cpu/valuepred/memory_renaming.test.opt
-
 
 echo -e "\n=== Running gem5 Microbenchmarks ==="
 cd "$SCRIPT_DIR"

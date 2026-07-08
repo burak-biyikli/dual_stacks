@@ -1,4 +1,4 @@
-# No Forwarding Synthetic Test
+# No Forwarding (Dependency) Synthetic Test
 # Designed to thwart the Memory Renaming Predictor by alternating the dependency between
 # loads and their producing stores, preventing the predictor from gaining confidence.
 
