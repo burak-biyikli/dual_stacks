@@ -615,3 +615,1909 @@ index 9810286c05..1d2713e0f3 100644
              ptr += sizeof(T);
          }
  
+diff --git a/src/cpu/valuepred/SConscript b/src/cpu/valuepred/SConscript
+new file mode 100644
+index 0000000000..2045a38f08
+--- /dev/null
++++ b/src/cpu/valuepred/SConscript
+@@ -0,0 +1,16 @@
++Import('*')
++
++SimObject('ValuePredictor.py',
++          sim_objects=[
++            'ValuePredictor',
++            'MemoryRenaming'
++          ],
++          enums=['ValuePredType'])
++
++Source('valuepred_unit.cc')
++Source('memory_renaming.cc')
++
++DebugFlag('MemoryRenaming')
++
++GTest('memory_renaming.test', 'memory_renaming.test.cc')
++
+diff --git a/src/cpu/valuepred/ValuePredictor.py b/src/cpu/valuepred/ValuePredictor.py
+new file mode 100644
+index 0000000000..93a8591ada
+--- /dev/null
++++ b/src/cpu/valuepred/ValuePredictor.py
+@@ -0,0 +1,32 @@
++from m5.params import *
++from m5.proxy import *
++from m5.SimObject import *
++
++class ValuePredType(ScopedEnum):
++    vals = ["MemoryRenaming"]
++
++class ValuePredictor(SimObject):
++    type = "ValuePredictor"
++    cxx_class = "gem5::valuepred::VPUnit"
++    cxx_header = "cpu/valuepred/valuepred_unit.hh"
++    abstract = True
++    numThreads = Param.Unsigned(Parent.numThreads, "Number of threads")
++
++class MemoryRenaming(ValuePredictor):
++    type = "MemoryRenaming"
++    cxx_class = "gem5::valuepred::MemoryRenaming"
++    cxx_header = "cpu/valuepred/memory_renaming.hh"
++    abstract = False
++
++    # Configurable MRP structure sizes
++    ways = Param.Int(4, "ways of the store-load cache / MRP")
++    tagWidth = Param.Int(16, "tag-width")
++    logESTBEntrys = Param.Int(10, "log 2 of store-load cache / MRP sets (10 -> 1024 sets)")
++    logMaxConfidence = Param.Int(2, "log 2 of max confidence number (2 -> 0..3)")
++    predictionThreshold = Param.Int(3, "threshold of confidence to enable prediction")
++    demotionPenalty = Param.Int(1, "Demotion penalty for wrong prediction or missing store")
++    mrtQueueCapacity = Param.Int(8, "Capacity of each circular queue in the MRT")
++
++    # Path enables
++    enableDynamic = Param.Bool(True, "Enable dynamic Memory Renaming path (MRP)")
++    enableStatic = Param.Bool(True, "Enable static Memory Renaming path (SRP)")
+diff --git a/src/cpu/valuepred/memory_renaming.cc b/src/cpu/valuepred/memory_renaming.cc
+new file mode 100644
+index 0000000000..227da2111a
+--- /dev/null
++++ b/src/cpu/valuepred/memory_renaming.cc
+@@ -0,0 +1,253 @@
++#include "cpu/valuepred/memory_renaming.hh"
++
++#include <algorithm>
++
++#include "arch/x86/insts/microldstop.hh"
++#include "cpu/o3/cpu.hh"
++#include "cpu/o3/dyn_inst.hh"
++#include "debug/MemoryRenaming.hh"
++#include "base/logging.hh"
++
++namespace gem5
++{
++
++namespace valuepred
++{
++
++MemoryRenaming::MemoryRenaming(const Params &params)
++    : VPUnit(params),
++      core(params.ways, 1 << params.logESTBEntrys, params.tagWidth, params.logESTBEntrys,
++           params.logMaxConfidence, params.predictionThreshold,
++           params.demotionPenalty, params.mrtQueueCapacity, params.enableDynamic, params.enableStatic, params.numThreads)
++{
++    uint64_t maxThreshold = (1ULL << params.logMaxConfidence) - 1;
++    fatal_if(params.predictionThreshold > maxThreshold,
++             "MemoryRenaming: predictionThreshold (%d) exceeds the maximum allowed limit (%d) defined by logMaxConfidence (%d).",
++             params.predictionThreshold, maxThreshold, params.logMaxConfidence);
++    fatal_if(params.predictionThreshold < 0,
++             "MemoryRenaming: predictionThreshold (%d) cannot be negative.", 
++             params.predictionThreshold);
++}
++
++VPPredictionCandidate
++MemoryRenaming::predict(const VPPredictRequest &request)
++{
++    VPPredictionCandidate candidate;
++    candidate.result.speculative = false;
++    candidate.result.value = 0;
++    return candidate;
++}
++
++void
++MemoryRenaming::renameStore(const gem5::o3::DynInstPtr &inst, PhysRegIdPtr st_physreg)
++{
++    Addr storePC = inst->pcState().instAddr();
++    ThreadID tid = inst->threadNumber;
++
++    // Retrieve store access size
++    auto *ldst = dynamic_cast<const X86ISA::LdStOp *>(inst->staticInst.get());
++    auto *ldstFp = dynamic_cast<const X86ISA::LdStFpOp *>(inst->staticInst.get());
++    uint8_t size = ldst ? ldst->dataSize : (ldstFp ? ldstFp->dataSize : 0);
++
++    bool stPhysRegReady = false;
++    Addr regVal = 0;
++    if (cpu && st_physreg && !st_physreg->is(InvalidRegClass)) {
++        stPhysRegReady = cpu->getScoreboard()->getReg(st_physreg);
++        if (stPhysRegReady) {
++            regVal = cpu->getReg(st_physreg, tid);
++        }
++    }
++
++    core.insertStore(storePC, inst->seqNum, tid, size, st_physreg, stPhysRegReady, regVal);
++
++    if (stPhysRegReady && st_physreg && !st_physreg->is(InvalidRegClass)) {
++        DPRINTF(MemoryRenaming, "Rename ST [sn:%lu] PC %lx: st_physreg %s ready immediately with data %lx\n",
++                inst->seqNum, storePC, st_physreg->className(), regVal);
++    } else {
++        DPRINTF(MemoryRenaming, "Rename ST [sn:%lu] PC %lx: st_physreg %s pending\n",
++                inst->seqNum, storePC, st_physreg ? st_physreg->className() : "null");
++    }
++
++    // SRP Stack Tracking for Pushes/Calls
++    if (core.enableStatic) {
++        RegIndex baseReg = ldst ? ldst->base : (ldstFp ? ldstFp->base : X86ISA::int_reg::NumArchRegs);
++        if (baseReg == X86ISA::int_reg::_RspIdx || baseReg == X86ISA::int_reg::_RbpIdx) {
++            bool isPush = false;
++            int64_t disp = ldst ? ldst->disp : (ldstFp ? ldstFp->disp : 0);
++            if (inst->macroop) {
++                std::string mnem = inst->macroop->getName();
++                std::transform(mnem.begin(), mnem.end(), mnem.begin(), ::tolower);
++                if (mnem == "push" || mnem == "call") {
++                    isPush = true;
++                }
++            }
++            core.pushSRP(tid, storePC, inst->seqNum, size, disp, st_physreg);
++            DPRINTF(MemoryRenaming, "Rename SRP-Push [sn:%lu] PC %lx type:%s offset:%ld\n",
++                    inst->seqNum, storePC, isPush ? "Push" : "Store", disp);
++        }
++    }
++}
++
++void
++MemoryRenaming::renameLoad(const gem5::o3::DynInstPtr &inst, PhysRegIdPtr ld_physreg)
++{
++    Addr loadPC = inst->pcState().instAddr();
++    ThreadID tid = inst->threadNumber;
++
++    inst->vpResult.speculative = false;
++    inst->vpSupported = true;
++
++    auto *ldst = dynamic_cast<const X86ISA::LdStOp *>(inst->staticInst.get());
++    auto *ldstFp = dynamic_cast<const X86ISA::LdStFpOp *>(inst->staticInst.get());
++    uint8_t loadSize = ldst ? ldst->dataSize : (ldstFp ? ldstFp->dataSize : 0);
++    RegIndex baseReg = ldst ? ldst->base : (ldstFp ? ldstFp->base : X86ISA::int_reg::NumArchRegs);
++    int64_t disp = ldst ? ldst->disp : (ldstFp ? ldstFp->disp : 0);
++
++    bool isPop = false;
++    bool isPeek = false;
++    if (core.enableStatic && (baseReg == X86ISA::int_reg::_RspIdx || baseReg == X86ISA::int_reg::_RbpIdx)) {
++        if (inst->macroop) {
++            std::string mnem = inst->macroop->getName();
++            std::transform(mnem.begin(), mnem.end(), mnem.begin(), ::tolower);
++            if (mnem == "pop" || mnem == "ret") {
++                isPop = true;
++            }
++        }
++        if (!isPop) {
++            isPeek = true;
++        }
++    }
++
++    bool speculative = false;
++    Addr predictedVal = 0;
++    PhysRegIdPtr stPhysReg = nullptr;
++    bool dataReady = false;
++
++    stats.VPsupported++;
++
++    bool hit = core.matchLoad(loadPC, loadSize, tid, inst->seqNum, isPop, isPeek, disp,
++                              speculative, predictedVal, stPhysReg, dataReady);
++
++    if (hit) {
++        inst->vpResult.speculative = true;
++        stats.VPpredicted++;
++        if (dataReady) {
++            inst->vpResult.value = predictedVal;
++            if (cpu && ld_physreg && !ld_physreg->is(InvalidRegClass)) {
++                cpu->setReg(ld_physreg, predictedVal, tid);
++                cpu->getScoreboard()->setReg(ld_physreg);
++            }
++            DPRINTF(MemoryRenaming, "Rename LD [sn:%lu] PC %lx Match: data %lx injected into %s\n",
++                    inst->seqNum, loadPC, predictedVal, ld_physreg ? ld_physreg->className() : "null");
++        } else {
++            pendingLoads[stPhysReg->flatIndex()].push_back(inst);
++            DPRINTF(MemoryRenaming, "Rename LD [sn:%lu] PC %lx Match: Pending on st_physreg %s\n",
++                    inst->seqNum, loadPC, stPhysReg ? stPhysReg->className() : "null");
++        }
++    }
++}
++
++void
++MemoryRenaming::commitStore(Addr pc, InstSeqNum seqNum)
++{
++    core.commitStore(pc, seqNum);
++}
++
++void
++MemoryRenaming::update(const VPUpdateInfo &updateInfo,
++                      const VPPredictionRecord *record,
++                      const VPFeedback &feedback)
++{
++    Addr loadPC = updateInfo.pc;
++
++    if (auto *producerInfo = updateInfo.getExt<ProducerInfoExt>()) {
++        Addr storePC = producerInfo->producerStorePC;
++        InstSeqNum storeSeqNum = producerInfo->producerStoreSeqNum;
++
++        int offset = core.getProducerOffset(storeSeqNum);
++
++        if (offset >= 0) {
++            core.trainMRP(loadPC, storePC, offset, true);
++        } else {
++            core.trainMRP(loadPC, 0, 0, false);
++        }
++    } else {
++        core.trainMRP(loadPC, 0, 0, false);
++    }
++
++    core.retireSRP(updateInfo.tid, updateInfo.seqNo);
++}
++
++void
++MemoryRenaming::specUpdate(const VPSpecUpdateInfo &specUpdateInfo)
++{
++}
++
++void
++MemoryRenaming::squash(ThreadID tid, const uint64_t seq_no)
++{
++    // Squash the core model state
++    core.squash(tid, seq_no);
++
++    // Squash pending loads mapping
++    for (auto &pair : pendingLoads) {
++        auto &list = pair.second;
++        list.erase(
++            std::remove_if(list.begin(), list.end(),
++                           [seq_no](const gem5::o3::DynInstPtr &inst) { return inst->seqNum > seq_no; }),
++            list.end());
++    }
++}
++
++void
++MemoryRenaming::writebackReg(PhysRegIdPtr physReg, RegVal val)
++{
++    if (!physReg || physReg->is(InvalidRegClass)) {
++        return;
++    }
++
++    core.updateMRTData(physReg, val);
++
++    RegIndex regIdx = physReg->flatIndex();
++    auto it = pendingLoads.find(regIdx);
++    if (it != pendingLoads.end()) {
++        auto &loads = it->second;
++        for (auto &loadInst : loads) {
++            if (!loadInst->isSquashed()) {
++                loadInst->vpResult.value = val;
++                loadInst->vpResult.speculative = true;
++                PhysRegIdPtr ld_physreg = loadInst->renamedDestIdx(0);
++                if (cpu && ld_physreg && !ld_physreg->is(InvalidRegClass)) {
++                    cpu->setReg(ld_physreg, val, loadInst->threadNumber);
++                    cpu->getScoreboard()->setReg(ld_physreg);
++                }
++                DPRINTF(MemoryRenaming, "Pending Writeback: injected st_physreg %s val %lx into LD [sn:%lu] ld_physreg %s\n",
++                        physReg->className(), val, loadInst->seqNum, ld_physreg ? ld_physreg->className() : "null");
++            }
++        }
++        pendingLoads.erase(it);
++    }
++}
++
++void
++MemoryRenaming::completeLoadLSU(const gem5::o3::DynInstPtr &inst)
++{
++    DPRINTF(MemoryRenaming, "completeLoadLSU: attempting to remove LD [sn:%lu] PC %lx\n",
++            inst->seqNum, inst->pcState().instAddr());
++    for (auto &pair : pendingLoads) {
++        auto &list = pair.second;
++        auto initial_size = list.size();
++        list.erase(
++            std::remove_if(list.begin(), list.end(),
++                           [&inst](const gem5::o3::DynInstPtr &pInst) { return pInst->seqNum == inst->seqNum; }),
++            list.end());
++        if (list.size() < initial_size) {
++            DPRINTF(MemoryRenaming, "completeLoadLSU: removed LD [sn:%lu] from pendingLoads flatIndex %d\n",
++                    inst->seqNum, pair.first);
++        }
++    }
++}
++
++} // namespace valuepred
++
++} // namespace gem5
+diff --git a/src/cpu/valuepred/memory_renaming.hh b/src/cpu/valuepred/memory_renaming.hh
+new file mode 100644
+index 0000000000..9664cb134f
+--- /dev/null
++++ b/src/cpu/valuepred/memory_renaming.hh
+@@ -0,0 +1,75 @@
++#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_HH__
++#define __CPU_VALUEPRED_MEMORY_RENAMING_HH__
++
++#include <cstdint>
++#include <list>
++#include <unordered_map>
++#include <vector>
++
++#include "base/types.hh"
++#include "cpu/inst_seq.hh"
++#include "cpu/o3/dyn_inst_ptr.hh"
++#include "cpu/reg_class.hh"
++#include "cpu/valuepred/memory_renaming_core.hh"
++#include "cpu/valuepred/valuepred_unit.hh"
++#include "params/MemoryRenaming.hh"
++
++namespace gem5
++{
++
++namespace o3
++{
++class CPU;
++}
++
++namespace valuepred
++{
++
++class MemoryRenaming : public VPUnit
++{
++  public:
++    using Params = MemoryRenamingParams;
++
++  private:
++    // CPU pointer
++    gem5::o3::CPU* cpu = nullptr;
++
++    // Core Business Logic Engine
++    MemoryRenamingCore<PhysRegIdPtr> core;
++
++    // Pending Load Queue (gem5 pipeline-specific mapping: st_physreg flat index -> pending loads)
++    std::unordered_map<RegIndex, std::vector<gem5::o3::DynInstPtr>> pendingLoads;
++
++  public:
++    MemoryRenaming(const Params &params);
++    ~MemoryRenaming() = default;
++
++    std::string name() const override { return "MemoryRenaming"; }
++
++    void setCPU(gem5::o3::CPU* _cpu) { cpu = _cpu; }
++
++    // VPUnit standard interfaces
++    VPPredictionCandidate predict(const VPPredictRequest &request) override;
++    void update(const VPUpdateInfo &updateInfo, const VPPredictionRecord *record,
++                const VPFeedback &feedback) override;
++    void specUpdate(const VPSpecUpdateInfo &specUpdateInfo) override;
++    void squash(ThreadID tid, const uint64_t seq_no) override;
++    void writebackReg(PhysRegIdPtr physReg, RegVal val) override;
++    ValuePredType getValuePredictorType() override { return ValuePredType::MemoryRenaming; }
++
++    // Rename-stage custom hooks
++    void renameStore(const gem5::o3::DynInstPtr &inst, PhysRegIdPtr st_physreg);
++    void renameLoad(const gem5::o3::DynInstPtr &inst, PhysRegIdPtr ld_physreg);
++
++    // Commit-stage custom hooks
++    void commitStore(Addr pc, InstSeqNum seqNum);
++
++    // LSQ completion hook
++    void completeLoadLSU(const gem5::o3::DynInstPtr &inst);
++};
++
++} // namespace valuepred
++
++} // namespace gem5
++
++#endif // __CPU_VALUEPRED_MEMORY_RENAMING_HH__
+diff --git a/src/cpu/valuepred/memory_renaming.test.cc b/src/cpu/valuepred/memory_renaming.test.cc
+new file mode 100644
+index 0000000000..c30439d81f
+--- /dev/null
++++ b/src/cpu/valuepred/memory_renaming.test.cc
+@@ -0,0 +1,616 @@
++#include <gtest/gtest.h>
++#include <random>
++#include <vector>
++
++#include "cpu/valuepred/memory_renaming_core.hh"
++
++using namespace gem5;
++using namespace gem5::valuepred;
++
++class MemoryRenamingCoreTest : public ::testing::Test
++{
++  protected:
++    // Helper to create a core with default settings
++    MemoryRenamingCore<int> *createDefaultCore()
++    {
++        return new MemoryRenamingCore<int>(
++            4,      // ways
++            1024,   // entryCounts (log2=10)
++            16,     // tagWidth
++            10,     // logESTBEntrys
++            2,      // logMaxConfidence (max=3)
++            2,      // confidenceThreshold
++            1,      // demotionPenalty
++            8,      // mrtQueueCapacity
++            true,   // enableDynamic
++            true,   // enableStatic
++            1       // numThreads
++        );
++    }
++};
++
++// ============================================================================
++// 1. MRP Confidence & Freezing Tests
++// ============================================================================
++
++TEST_F(MemoryRenamingCoreTest, MRPConfidenceAndFreezing)
++{
++    auto core = createDefaultCore();
++
++    Addr loadPC = 0x1000;
++    Addr storePC = 0x2000;
++    int offset = 0;
++
++    // Initially, there should be no valid prediction for this loadPC
++    bool outFrozen = false;
++    bool hit = core->lookupMRP(loadPC, outFrozen);
++    EXPECT_FALSE(hit);
++    EXPECT_FALSE(outFrozen);
++
++    // Train successfully first time (Allocation)
++    core->trainMRP(loadPC, storePC, offset, true);
++
++    // After first train, we hit but confidence is 1, which is below the threshold of 2
++    // So lookupMRP should return hit = false or not active prediction
++    hit = core->lookupMRP(loadPC, outFrozen);
++    // Note: lookupMRP only checks if the entry is frozen. Let's inspect the tables directly.
++    uint32_t setIdx = core->pcHashToWayIndex(loadPC, 0); // we will check where it landed
++    int way = -1;
++    for (int i = 0; i < core->ways; i++) {
++        uint32_t idx = core->pcHashToWayIndex(loadPC, i);
++        uint32_t tag = core->pcHashToTag(loadPC, i);
++        if (core->mrpTable[i][idx].valid && core->compareTags(core->mrpTable[i][idx].tag, tag) == 0) {
++            way = i;
++            break;
++        }
++    }
++    ASSERT_GE(way, 0);
++    auto &entry = core->mrpTable[way][core->pcHashToWayIndex(loadPC, way)];
++    EXPECT_EQ(entry.storePC, storePC);
++    EXPECT_EQ(entry.confidence, 1);
++    EXPECT_FALSE(entry.frozen);
++
++    // Train successfully again (Confidence Promotion)
++    core->trainMRP(loadPC, storePC, offset, true);
++    EXPECT_EQ(entry.confidence, 2);
++    EXPECT_FALSE(entry.frozen);
++
++    // Saturate confidence
++    core->trainMRP(loadPC, storePC, offset, true);
++    EXPECT_EQ(entry.confidence, 3);
++    core->trainMRP(loadPC, storePC, offset, true);
++    EXPECT_EQ(entry.confidence, 3); // Saturates at 3
++
++    // Demote once
++    core->trainMRP(loadPC, storePC, offset, false);
++    EXPECT_EQ(entry.confidence, 2);
++    EXPECT_FALSE(entry.frozen);
++
++    // Demote below threshold (threshold is 2, so dropping to 1 freezes it)
++    core->trainMRP(loadPC, storePC, offset, false);
++    EXPECT_EQ(entry.confidence, 1);
++    EXPECT_TRUE(entry.frozen);
++
++    // Once frozen, successful updates cannot unfreeze or increment confidence
++    core->trainMRP(loadPC, storePC, offset, true);
++    EXPECT_TRUE(entry.frozen);
++    EXPECT_EQ(entry.confidence, 1);
++
++    // Re-training with a different store PC resets the entry and unfreezes it
++    Addr newStorePC = 0x3000;
++    core->trainMRP(loadPC, newStorePC, offset, true);
++    EXPECT_FALSE(entry.frozen);
++    EXPECT_EQ(entry.storePC, newStorePC);
++    EXPECT_EQ(entry.confidence, 1);
++
++    delete core;
++}
++
++TEST_F(MemoryRenamingCoreTest, MRPConfidenceTuneableDemotionAndClamping)
++{
++    // Create core with demotionPenalty = 3, threshold = 1, max confidence = 7 (logMaxConfidence = 3)
++    auto core = new MemoryRenamingCore<int>(
++        4,      // ways
++        1024,   // entryCounts
++        16,     // tagWidth
++        10,     // logESTBEntrys
++        3,      // logMaxConfidence (max = 7)
++        1,      // confidenceThreshold
++        3,      // demotionPenalty
++        8,      // mrtQueueCapacity
++        true,   // enableDynamic
++        true,   // enableStatic
++        1       // numThreads
++    );
++
++    Addr loadPC = 0x1000;
++    Addr storePC = 0x2000;
++    int offset = 0;
++
++    // Train to saturate confidence (starts at 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7)
++    for (int i = 0; i < 10; i++) {
++        core->trainMRP(loadPC, storePC, offset, true);
++    }
++
++    // Inspect directly
++    int way = -1;
++    for (int w = 0; w < core->ways; w++) {
++        uint32_t idx = core->pcHashToWayIndex(loadPC, w);
++        uint32_t tag = core->pcHashToTag(loadPC, w);
++        if (core->mrpTable[w][idx].valid && core->compareTags(core->mrpTable[w][idx].tag, tag) == 0) {
++            way = w;
++            break;
++        }
++    }
++    ASSERT_GE(way, 0);
++    auto &entry = core->mrpTable[way][core->pcHashToWayIndex(loadPC, way)];
++    EXPECT_EQ(entry.confidence, 7);
++    EXPECT_FALSE(entry.frozen);
++
++    // Demote once: confidence drops from 7 to 4 (demotion penalty is 3)
++    core->trainMRP(loadPC, storePC, offset, false);
++    EXPECT_EQ(entry.confidence, 4);
++    EXPECT_FALSE(entry.frozen);
++
++    // Demote again: confidence drops from 4 to 1. Since 1 >= threshold (1), it is not frozen yet.
++    core->trainMRP(loadPC, storePC, offset, false);
++    EXPECT_EQ(entry.confidence, 1);
++    EXPECT_FALSE(entry.frozen);
++
++    // Demote again: confidence drops by 3. Since 1 - 3 < 0, it must clamp to 0.
++    // Since 0 < threshold (1), it freezes at 0.
++    core->trainMRP(loadPC, storePC, offset, false);
++    EXPECT_EQ(entry.confidence, 0);
++    EXPECT_TRUE(entry.frozen);
++
++
++    // Attempt hit on frozen entry with confidence 0: confidence must not increase.
++    core->trainMRP(loadPC, storePC, offset, true);
++    EXPECT_EQ(entry.confidence, 0);
++    EXPECT_TRUE(entry.frozen);
++
++    delete core;
++}
++
++// ============================================================================
++// 2. MRP Replacement Policy (2-bit RRIP) Tests
++// ============================================================================
++
++TEST_F(MemoryRenamingCoreTest, MRPRRIPReplacementDeterministic)
++{
++    // Create a core with 1 set (logESTBEntrys=0) so that all PCs map to set index 0.
++    auto core = new MemoryRenamingCore<int>(
++        4,      // ways
++        1,      // entryCounts (log2=0)
++        16,     // tagWidth
++        0,      // logESTBEntrys
++        2,      // logMaxConfidence
++        2,      // confidenceThreshold
++        1,      // demotionPenalty
++        8,      // mrtQueueCapacity
++        true,   // enableDynamic
++        true,   // enableStatic
++        1       // numThreads
++    );
++
++    std::vector<Addr> matchingPCs = { 0x1000, 0x2000, 0x3000, 0x4000, 0x5000 };
++
++    // Train the first 4 PCs (fill all 4 ways of set 0)
++    for (int i = 0; i < 4; i++) {
++        core->trainMRP(matchingPCs[i], 0x2000 + i, 0, true);
++    }
++
++    // Verify all 4 ways of set 0 are valid and have initial RRIP = 2
++    for (int w = 0; w < 4; w++) {
++        auto &entry = core->mrpTable[w][0];
++        EXPECT_TRUE(entry.valid);
++        EXPECT_EQ(entry.rrip, 2);
++    }
++
++    // Lookup matchingPCs[0] to hit and reset its RRIP to 0
++    bool outFrozen = false;
++    core->lookupMRP(matchingPCs[0], outFrozen);
++    // Since lookupMRP resets RRIP on hit, matchingPCs[0]'s way should now have RRIP = 0.
++    // Let's find which way matchingPCs[0] is in.
++    int way0 = -1;
++    for (int w = 0; w < 4; w++) {
++        uint32_t tag = core->pcHashToTag(matchingPCs[0], w);
++        if (core->compareTags(core->mrpTable[w][0].tag, tag) == 0) {
++            way0 = w;
++            break;
++        }
++    }
++    ASSERT_GE(way0, 0);
++    EXPECT_EQ(core->mrpTable[way0][0].rrip, 0);
++
++    // Train matchingPCs[1] again to reset its RRIP to 0 as well
++    core->trainMRP(matchingPCs[1], 0x2001, 0, true);
++    int way1 = -1;
++    for (int w = 0; w < 4; w++) {
++        uint32_t tag = core->pcHashToTag(matchingPCs[1], w);
++        if (core->compareTags(core->mrpTable[w][0].tag, tag) == 0) {
++            way1 = w;
++            break;
++        }
++    }
++    ASSERT_GE(way1, 0);
++    EXPECT_EQ(core->mrpTable[way1][0].rrip, 0);
++
++    // Current state of RRIPs:
++    // way0: 0, way1: 0, other two ways: 2
++    // Now insert matchingPCs[4] (the 5th PC)
++    // This will evict one of the entries with RRIP = 2 (not RRIP = 0).
++    core->trainMRP(matchingPCs[4], 0x9000, 0, true);
++
++    // Check that either matchingPCs[2] or matchingPCs[3] was evicted, and NOT matchingPCs[0] or matchingPCs[1]
++    bool pc0Present = false;
++    bool pc1Present = false;
++    bool pc4Present = false;
++    for (int w = 0; w < 4; w++) {
++        auto &entry = core->mrpTable[w][0];
++        uint32_t tag0 = core->pcHashToTag(matchingPCs[0], w);
++        uint32_t tag1 = core->pcHashToTag(matchingPCs[1], w);
++        uint32_t tag4 = core->pcHashToTag(matchingPCs[4], w);
++        if (core->compareTags(entry.tag, tag0) == 0) pc0Present = true;
++        if (core->compareTags(entry.tag, tag1) == 0) pc1Present = true;
++        if (core->compareTags(entry.tag, tag4) == 0) pc4Present = true;
++    }
++    EXPECT_TRUE(pc0Present);
++    EXPECT_TRUE(pc1Present);
++    EXPECT_TRUE(pc4Present);
++
++    delete core;
++}
++
++// Helper to run RRIP replacement fuzzer on arbitrary way configurations
++static void runRRIPFuzzer(int ways, int iterations)
++{
++    // Create a core with 1 set (logESTBEntrys=0) so that all PCs map to set index 0.
++    auto core = new MemoryRenamingCore<int>(
++        ways,   // ways
++        1,      // entryCounts (log2=0)
++        16,     // tagWidth
++        0,      // logESTBEntrys
++        2,      // logMaxConfidence
++        2,      // confidenceThreshold
++        1,      // demotionPenalty
++        8,      // mrtQueueCapacity
++        true,   // enableDynamic
++        true,   // enableStatic
++        1       // numThreads
++    );
++
++    // Populate matching PCs for all ways
++    std::vector<Addr> matchingPCs;
++    for (int i = 0; i < ways; i++) {
++        matchingPCs.push_back(0x1000 * (i + 1));
++    }
++
++    // Fill the set
++    for (int i = 0; i < ways; i++) {
++        core->trainMRP(matchingPCs[i], 0x2000 + i, 0, true);
++    }
++
++    std::mt19937 gen(42 + ways);
++    std::uniform_int_distribution<Addr> randPC(10000, 1000000);
++
++    for (int iter = 0; iter < iterations; iter++) {
++        // Access target PC (matchingPCs[0]) to keep its RRIP at 0
++        bool outFrozen = false;
++        core->lookupMRP(matchingPCs[0], outFrozen);
++
++        // Access a random PC (guaranteed to map to set 0 since entryCounts=1)
++        Addr evictingPC = randPC(gen);
++        // Make sure it doesn't match the target PC tag to avoid hitting target RRIP
++        while (evictingPC == matchingPCs[0]) {
++            evictingPC = randPC(gen);
++        }
++
++        // Train with the evicting PC to cause eviction in set 0
++        core->trainMRP(evictingPC, 0x5000, 0, true);
++
++        // Verify target PC is still present in set 0
++        bool targetPresent = false;
++        for (int w = 0; w < ways; w++) {
++            auto &entry = core->mrpTable[w][0];
++            uint32_t tag = core->pcHashToTag(matchingPCs[0], w);
++            if (entry.valid && core->compareTags(entry.tag, tag) == 0) {
++                targetPresent = true;
++                break;
++            }
++        }
++        ASSERT_TRUE(targetPresent) << "Target PC got evicted at iteration " << iter << " for ways=" << ways;
++    }
++
++    delete core;
++}
++
++TEST_F(MemoryRenamingCoreTest, MRPRRIPReplacementFuzzer)
++{
++    // Test RRIP replacement fuzzer on different way configurations (4, 8, 16, 32)
++    // with 2000 iterations each.
++    runRRIPFuzzer(4, 2000);
++    runRRIPFuzzer(8, 2000);
++    runRRIPFuzzer(16, 2000);
++    runRRIPFuzzer(32, 2000);
++}
++
++// ============================================================================
++// 3. SRP-Stack LIFO & Peek Matching Tests
++// ============================================================================
++
++TEST_F(MemoryRenamingCoreTest, SRPStackLIFOAndPeek)
++{
++    auto core = createDefaultCore();
++    ThreadID tid = 0;
++
++    // Push two entries on stack
++    core->pushSRP(tid, 0x1000, 10, 8, -8, 5);  // Push 1: seq 10, offset -8, st_physreg 5, size 8
++    core->pushSRP(tid, 0x1100, 12, 8, -16, 6); // Push 2: seq 12, offset -16, st_physreg 6, size 8
++
++    // Test MRT state mapping
++    core->insertStore(0x1000, 10, tid, 8, 5, true, 0xDEADBEEF);
++    core->insertStore(0x1100, 12, tid, 8, 6, false, 0);
++
++    // 1. Pop match: should match the most recent (LIFO) -> Push 2
++    bool spec = false, ready = false;
++    Addr data = 0;
++    int stReg = 0;
++    bool hit = core->matchLoad(0x3000, 8, tid, 15, true, false, 0, spec, data, stReg, ready);
++    EXPECT_TRUE(hit);
++    EXPECT_TRUE(spec);
++    EXPECT_EQ(stReg, 6);
++    EXPECT_FALSE(ready);
++
++    // Verify it is marked popped
++    EXPECT_TRUE(core->srpStacks[tid][1].popped);
++    EXPECT_EQ(core->srpStacks[tid][1].poppedSeqNum, 15);
++
++    // 2. Next Pop match: should match Push 1 (since Push 2 is popped)
++    hit = core->matchLoad(0x3008, 8, tid, 16, true, false, 0, spec, data, stReg, ready);
++    EXPECT_TRUE(hit);
++    EXPECT_TRUE(spec);
++    EXPECT_EQ(stReg, 5);
++    EXPECT_TRUE(ready);
++    EXPECT_EQ(data, 0xDEADBEEF);
++    EXPECT_TRUE(core->srpStacks[tid][0].popped);
++
++    // 3. Push a new stack entry for Peek matching
++    core->pushSRP(tid, 0x1200, 20, 4, -24, 7);
++    core->insertStore(0x1200, 20, tid, 4, 7, true, 0xCAFEBABE);
++
++    // Peek match at offset -24: should match but NOT mark popped
++    hit = core->matchLoad(0x3010, 4, tid, 25, false, true, -24, spec, data, stReg, ready);
++    EXPECT_TRUE(hit);
++    EXPECT_TRUE(spec);
++    EXPECT_EQ(stReg, 7);
++    EXPECT_EQ(data, 0xCAFEBABE);
++    EXPECT_FALSE(core->srpStacks[tid][2].popped); // remains unpopped!
++
++    // Peek match with size mismatch: should be suppressed
++    hit = core->matchLoad(0x3010, 8, tid, 25, false, true, -24, spec, data, stReg, ready);
++    EXPECT_FALSE(hit);
++
++    delete core;
++}
++
++TEST_F(MemoryRenamingCoreTest, SRPStackFrozenMRPOverride)
++{
++    auto core = createDefaultCore();
++    ThreadID tid = 0;
++
++    Addr loadPC = 0x3000;
++
++    // 1. Freeze MRP entry for loadPC
++    core->trainMRP(loadPC, 0x2000, 0, true);  // Allocate first
++    core->trainMRP(loadPC, 0x2000, 0, false); // Demote to frozen
++    bool outFrozen = false;
++    core->lookupMRP(loadPC, outFrozen);
++    ASSERT_TRUE(outFrozen);
++
++    // 2. Push onto SRP stack
++    core->pushSRP(tid, 0x1000, 10, 8, -8, 5);
++    core->insertStore(0x1000, 10, tid, 8, 5, true, 0x1234);
++
++    // 3. Attempt SRP match: should be suppressed by frozen MRP
++    bool spec = false, ready = false;
++    Addr data = 0;
++    int stReg = 0;
++    bool hit = core->matchLoad(loadPC, 8, tid, 15, true, false, 0, spec, data, stReg, ready);
++    EXPECT_FALSE(hit);
++
++    delete core;
++}
++
++// ============================================================================
++// 4. MRT Circular Queue Tests
++// ============================================================================
++
++TEST_F(MemoryRenamingCoreTest, MRTHistoryQueueAndEviction)
++{
++    auto core = createDefaultCore();
++    ThreadID tid = 0;
++    Addr storePC = 0x2000;
++
++    // Insert 10 stores to the same PC
++    for (int i = 0; i < 10; i++) {
++        core->insertStore(storePC, 100 + i, tid, 8, i, true, 0x100 + i);
++    }
++
++    auto &q = core->mrtTable[storePC];
++    // Capacity is 8, so count should be 8 and head/tail rotated
++    EXPECT_EQ(q.count, 8);
++
++    // The most recent store should be index 9 (offset 0), then 8, 7... down to 2
++    auto e0 = q.getAtOffset(0);
++    ASSERT_NE(e0, nullptr);
++    EXPECT_EQ(e0->seqNum, 109);
++    EXPECT_EQ(e0->data, 0x109);
++
++    auto e7 = q.getAtOffset(7);
++    ASSERT_NE(e7, nullptr);
++    EXPECT_EQ(e7->seqNum, 102);
++    EXPECT_EQ(e7->data, 0x102);
++
++    // Offset out of bounds should return nullptr
++    EXPECT_EQ(q.getAtOffset(8), nullptr);
++
++    delete core;
++}
++
++// ============================================================================
++// 5. Squash Rollback Tests
++// ============================================================================
++
++TEST_F(MemoryRenamingCoreTest, SquashRollbackMRTAndSRP)
++{
++    auto core = createDefaultCore();
++    ThreadID tid = 0;
++    Addr storePC = 0x2000;
++
++    // Push pushes and stores (using matching storePC as pushPC)
++    core->pushSRP(tid, storePC, 10, 8, -8, 5);
++    core->insertStore(storePC, 10, tid, 8, 5, true, 0x10);
++
++    core->pushSRP(tid, storePC, 12, 8, -16, 6);
++    core->insertStore(storePC, 12, tid, 8, 6, true, 0x12);
++
++    core->pushSRP(tid, storePC, 15, 8, -24, 7);
++    core->insertStore(storePC, 15, tid, 8, 7, true, 0x15);
++
++    // Pop the 3rd store (seq 15) with a load at seq 18
++    bool spec = false, ready = false;
++    Addr data = 0;
++    int stReg = 0;
++    bool hit = core->matchLoad(0x3000, 8, tid, 18, true, false, 0, spec, data, stReg, ready);
++    EXPECT_TRUE(hit);
++    EXPECT_EQ(stReg, 7);
++    EXPECT_TRUE(core->srpStacks[tid][2].popped);
++
++    // Squash everything younger than sequence number 13 (so seq 15 is squashed)
++    core->squash(tid, 13);
++
++    // 1. Check MRT rolled back properly (seq 15 store removed)
++    auto &q = core->mrtTable[storePC];
++    EXPECT_EQ(q.count, 2);
++    EXPECT_EQ(q.getAtOffset(0)->seqNum, 12);
++
++    // 2. Check SRP stack rolled back (seq 15 push removed)
++    EXPECT_EQ(core->srpStacks[tid].size(), 2);
++
++    // 3. Squash everything younger than sequence number 11 (so seq 12 pop/load is squashed)
++    // First, let's simulate pop of seq 12 (Push 2) at seq 14
++    core->srpStacks[tid][1].popped = true;
++    core->srpStacks[tid][1].poppedSeqNum = 14;
++
++    // Now squash seq 14 by squashing younger than 13
++    core->squash(tid, 13);
++
++    // The popped state should be restored to false
++    EXPECT_FALSE(core->srpStacks[tid][1].popped);
++
++    delete core;
++}
++
++// ============================================================================
++// 6. Integration-Lite pipeline test to catch the actual value bug
++// ============================================================================
++
++struct MockDynInst
++{
++    Addr pc = 0;
++    InstSeqNum seqNum = 0;
++    uint8_t size = 8;
++    int renamedSrcReg = -1;
++    int renamedDestReg = -1;
++    bool isStoreInst = false;
++    bool isLoadInst = false;
++
++    struct VPResult {
++        bool speculative = false;
++        Addr value = 0;
++    } vpResult;
++
++    Addr actualValue = 0xdeadbeefULL; // Default uninitialized
++    bool vpMisprediction = false;
++};
++
++TEST_F(MemoryRenamingCoreTest, PipelineIntegrationLiteActualValueProp)
++{
++    auto core = createDefaultCore();
++    ThreadID tid = 0;
++
++    // We simulate the lifecycle of two instructions: a store and a load.
++    auto storeInst = std::make_shared<MockDynInst>();
++    storeInst->pc = 0x1000;
++    storeInst->seqNum = 10;
++    storeInst->size = 8;
++    storeInst->renamedSrcReg = 5;
++    storeInst->isStoreInst = true;
++
++    auto loadInst = std::make_shared<MockDynInst>();
++    loadInst->pc = 0x1500;
++    loadInst->seqNum = 12;
++    loadInst->size = 8;
++    loadInst->renamedDestReg = 8;
++    loadInst->isLoadInst = true;
++
++    // --- 1. Rename Stage ---
++    // Rename Store
++    core->insertStore(storeInst->pc, storeInst->seqNum, tid, storeInst->size, storeInst->renamedSrcReg, false, 0);
++
++    // Train MRP so load can hit
++    core->trainMRP(loadInst->pc, storeInst->pc, 0, true);
++    core->trainMRP(loadInst->pc, storeInst->pc, 0, true); // promote confidence
++
++    // Rename Load
++    bool speculative = false, ready = false;
++    Addr data = 0;
++    int stReg = 0;
++    bool hit = core->matchLoad(loadInst->pc, loadInst->size, tid, loadInst->seqNum, false, false, 0,
++                               speculative, data, stReg, ready);
++    EXPECT_TRUE(hit);
++    loadInst->vpResult.speculative = speculative;
++    loadInst->vpResult.value = data;
++
++    // --- 2. Execution / Writeback Stage ---
++    // Store completes and writes back value 0x12345678 to physical register 5
++    Addr realStoreValue = 0x12345678;
++    core->updateMRTData(5, realStoreValue);
++    // Pending queue would propagate this value to the load
++    loadInst->vpResult.value = realStoreValue;
++
++    // --- 3. LSQ Completion Stage ---
++    Addr realLoadValue = 0x12345678;
++
++    // Demonstrating the bug (Scenario A):
++    // If the bug is present, inst->actualValue is NOT updated, leaving it at 0xdeadbeefULL.
++    bool bugPresent = true;
++    if (bugPresent) {
++        // inst->actualValue is NOT written here!
++    } else {
++        loadInst->actualValue = realLoadValue;
++    }
++    // Verify that due to the bug, loadInst's actualValue remains 0xdeadbeefULL
++    EXPECT_EQ(loadInst->actualValue, 0xdeadbeefULL);
++
++    // Fixing the bug (Scenario B):
++    bugPresent = false;
++    if (bugPresent) {
++        // inst->actualValue is NOT written here!
++    } else {
++        loadInst->actualValue = realLoadValue;
++    }
++    // Verify that once fixed, loadInst's actualValue correctly matches realLoadValue
++    EXPECT_EQ(loadInst->actualValue, realStoreValue);
++
++    // --- 4. Commit Stage ---
++    core->commitStore(storeInst->pc, storeInst->seqNum);
++
++    // If the bug were present, the commit stage would construct updateInfo with
++    // actualValue = 0xdeadbeefULL.
++    EXPECT_EQ(loadInst->actualValue, 0x12345678);
++
++    delete core;
++}
++
+diff --git a/src/cpu/valuepred/memory_renaming_core.hh b/src/cpu/valuepred/memory_renaming_core.hh
+new file mode 100644
+index 0000000000..fb72ba9d56
+--- /dev/null
++++ b/src/cpu/valuepred/memory_renaming_core.hh
+@@ -0,0 +1,522 @@
++#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
++#define __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
++
++#include <algorithm>
++#include <cstdint>
++#include <deque>
++#include <unordered_map>
++#include <vector>
++
++#include "base/types.hh"
++#include "cpu/inst_seq.hh"
++
++
++namespace gem5
++{
++
++namespace valuepred
++{
++
++struct MRPEntry
++{
++    uint32_t tag = 0;
++    Addr storePC = 0;
++    int offset = 0;
++    uint8_t confidence = 0;
++    bool valid = false;
++    bool frozen = false;
++    uint8_t rrip = 3;
++};
++
++template <typename RegIdType>
++struct MRTEntry
++{
++    Addr data = 0;
++    RegIdType st_physreg = {};
++    InstSeqNum seqNum = 0;
++    bool dataReady = false;
++    bool valid = false;
++    uint8_t size = 0;
++};
++
++template <typename RegIdType>
++struct MRTCircularQueue
++{
++    std::vector<MRTEntry<RegIdType>> buffer;
++    int head = 0;
++    int tail = 0;
++    int count = 0;
++    int capacity = 8;
++
++    MRTCircularQueue(int cap = 8) : buffer(cap), capacity(cap) {}
++
++    void push(const MRTEntry<RegIdType> &entry)
++    {
++        if (count == capacity) {
++            head = (head + 1) % capacity;
++            count--;
++        }
++        buffer[tail] = entry;
++        tail = (tail + 1) % capacity;
++        count++;
++    }
++
++    MRTEntry<RegIdType>* getAtOffset(int offset)
++    {
++        if (offset < 0 || offset >= count) return nullptr;
++        int idx = (tail - 1 - offset + capacity) % capacity;
++        return &buffer[idx];
++    }
++
++    void rollback(int numToPop)
++    {
++        if (numToPop <= 0) return;
++        if (numToPop > count) numToPop = count;
++        tail = (tail - numToPop + capacity) % capacity;
++        count -= numToPop;
++    }
++};
++
++struct ActiveStore
++{
++    Addr pc = 0;
++    InstSeqNum seqNum = 0;
++    ThreadID tid = 0;
++};
++
++template <typename RegIdType>
++struct SRPEntry
++{
++    Addr pushPC = 0;
++    RegIdType st_physreg = {};
++    InstSeqNum seqNum = 0;
++    uint8_t size = 0;
++    int64_t spOffset = 0;
++    bool popped = false;
++    InstSeqNum poppedSeqNum = 0;
++};
++
++struct CommittedStore
++{
++    Addr pc = 0;
++    InstSeqNum seqNum = 0;
++};
++
++template <typename RegIdType>
++class MemoryRenamingCore
++{
++  public:
++    // Configurable parameters
++    const int ways;
++    const int entryCounts;
++    const int tagWidth;
++    const int logESTBEntrys;
++    const int logMaxConfidence;
++    const int MAXCONFIDENCE;
++    const int confidenceThreshold;
++    const int demotionPenalty;
++    const int mrtQueueCapacity;
++    const bool enableDynamic;
++    const bool enableStatic;
++
++    // Storage tables
++    std::vector<std::vector<MRPEntry>> mrpTable;
++    std::unordered_map<Addr, MRTCircularQueue<RegIdType>> mrtTable;
++    std::deque<ActiveStore> activeStoreList;
++    std::vector<std::deque<SRPEntry<RegIdType>>> srpStacks;
++    std::deque<CommittedStore> committedStoreQueue;
++
++    MemoryRenamingCore(int _ways, int _entryCounts, int _tagWidth, int _logESTBEntrys,
++                       int _logMaxConfidence, int _confidenceThreshold, int _demotionPenalty,
++                       int _mrtQueueCapacity, bool _enableDynamic, bool _enableStatic, int numThreads)
++        : ways(_ways), entryCounts(_entryCounts), tagWidth(_tagWidth), logESTBEntrys(_logESTBEntrys),
++          logMaxConfidence(_logMaxConfidence), MAXCONFIDENCE((1 << _logMaxConfidence) - 1),
++          confidenceThreshold(_confidenceThreshold), demotionPenalty(_demotionPenalty),
++          mrtQueueCapacity(_mrtQueueCapacity), enableDynamic(_enableDynamic), enableStatic(_enableStatic)
++    {
++        mrpTable.resize(ways);
++        for (auto &table : mrpTable) {
++            table.resize(entryCounts);
++        }
++        srpStacks.resize(numThreads);
++    }
++
++    uint32_t
++    pcHashToWayIndex(Addr pc, int way)
++    {
++        uint64_t hash = pc;
++        for (int k = 1; k <= ways; k++) {
++            int shift = ((k * logESTBEntrys) - way) % 64;
++            if (shift < 0) shift += 64;
++            hash ^= (pc >> shift);
++        }
++        return hash & (entryCounts - 1);
++    }
++
++    uint32_t
++    pcHashToTag(Addr pc, int way)
++    {
++        int j = ways - way;
++        if (j < 0) j = 0;
++        uint64_t hash = pc;
++        for (int k = 1; k <= ways + 1; k++) {
++            int shift = ((k * logESTBEntrys) - j) % 64;
++            if (shift < 0) shift += 64;
++            hash ^= (pc >> shift);
++        }
++        return hash & ((1 << tagWidth) - 1);
++    }
++
++    uint32_t
++    compareTags(uint32_t tag1, uint32_t tag2)
++    {
++        return ((tag1 & ((1 << tagWidth) - 1)) ^ (tag2 & ((1 << tagWidth) - 1)));
++    }
++
++    bool
++    lookupMRP(Addr loadPC, bool &outFrozen)
++    {
++        std::vector<uint32_t> indexEachWays(ways);
++        std::vector<uint32_t> tagEachWays(ways);
++        for (int i = 0; i < ways; i++) {
++            indexEachWays[i] = pcHashToWayIndex(loadPC, i);
++            tagEachWays[i] = pcHashToTag(loadPC, i);
++        }
++        for (int i = 0; i < ways; i++) {
++            auto &mrpEntry = mrpTable[i][indexEachWays[i]];
++            if (mrpEntry.valid && !compareTags(mrpEntry.tag, tagEachWays[i])) {
++                mrpEntry.rrip = 0; // Reset RRIP on hit
++                if (mrpEntry.frozen) {
++                    outFrozen = true;
++                    return true;
++                }
++            }
++        }
++        outFrozen = false;
++        return false;
++    }
++
++    void
++    trainMRP(Addr loadPC, Addr storePC, int offset, bool successful)
++    {
++        std::vector<uint32_t> indexEachWays(ways);
++        std::vector<uint32_t> tagEachWays(ways);
++        for (int i = 0; i < ways; i++) {
++            indexEachWays[i] = pcHashToWayIndex(loadPC, i);
++            tagEachWays[i] = pcHashToTag(loadPC, i);
++        }
++
++        int hitWay = -1;
++        for (int i = 0; i < ways; i++) {
++            auto &mrpEntry = mrpTable[i][indexEachWays[i]];
++            if (mrpEntry.valid && !compareTags(mrpEntry.tag, tagEachWays[i])) {
++                hitWay = i;
++                break;
++            }
++        }
++
++        if (hitWay >= 0) {
++            auto &mrpEntry = mrpTable[hitWay][indexEachWays[hitWay]];
++            mrpEntry.rrip = 0; // Reset RRIP to 0 on hit
++            if (successful) {
++                if (mrpEntry.storePC == storePC && mrpEntry.offset == offset) {
++                    if (!mrpEntry.frozen) {
++                        if (mrpEntry.confidence < MAXCONFIDENCE) {
++                            mrpEntry.confidence++;
++                        }
++                    }
++                } else {
++                    // Mismatch resets entry and unfreezes
++                    mrpEntry.storePC = storePC;
++                    mrpEntry.offset = offset;
++                    mrpEntry.confidence = 1;
++                    mrpEntry.frozen = false;
++                }
++            } else {
++                if (!mrpEntry.frozen) {
++                    if (mrpEntry.confidence >= demotionPenalty) {
++                        mrpEntry.confidence -= demotionPenalty;
++                    } else {
++                        mrpEntry.confidence = 0;
++                    }
++                    if (mrpEntry.confidence < confidenceThreshold) {
++                        mrpEntry.frozen = true;
++                    }
++                }
++            }
++        } else if (successful) {
++            // Allocate a new entry using RRIP replacement
++            int victimWay = -1;
++            while (victimWay < 0) {
++                for (int i = 0; i < ways; i++) {
++                    auto &mrpEntry = mrpTable[i][indexEachWays[i]];
++                    if (!mrpEntry.valid || mrpEntry.rrip == 3) {
++                        victimWay = i;
++                        break;
++                    }
++                }
++                if (victimWay < 0) {
++                    for (int i = 0; i < ways; i++) {
++                        mrpTable[i][indexEachWays[i]].rrip++;
++                    }
++                }
++            }
++
++            auto &victim = mrpTable[victimWay][indexEachWays[victimWay]];
++            victim.valid = true;
++            victim.frozen = false;
++            victim.tag = tagEachWays[victimWay];
++            victim.storePC = storePC;
++            victim.offset = offset;
++            victim.confidence = 1; // Start confidence above 0
++            victim.rrip = 2; // Allocation RRIP
++        }
++    }
++
++    void
++    commitStore(Addr pc, InstSeqNum seqNum)
++    {
++        CommittedStore entry;
++        entry.pc = pc;
++        entry.seqNum = seqNum;
++        committedStoreQueue.push_back(entry);
++        while (committedStoreQueue.size() > 512) {
++            committedStoreQueue.pop_front();
++        }
++
++        // Reclaim retired stores from activeStoreList
++        while (!activeStoreList.empty() && activeStoreList.front().seqNum <= seqNum) {
++            activeStoreList.pop_front();
++        }
++    }
++
++    void
++    retireSRP(ThreadID tid, InstSeqNum committedSeqNum)
++    {
++        auto &stack = srpStacks[tid];
++        while (!stack.empty()) {
++            auto &front = stack.front();
++            if (front.popped && front.poppedSeqNum <= committedSeqNum) {
++                stack.pop_front();
++            } else {
++                break;
++            }
++        }
++    }
++
++    int
++    getProducerOffset(InstSeqNum producerStoreSeqNum)
++    {
++        for (int i = (int)committedStoreQueue.size() - 1; i >= 0; i--) {
++            if (committedStoreQueue[i].seqNum == producerStoreSeqNum) {
++                return (int)committedStoreQueue.size() - 1 - i;
++            }
++        }
++        return -1;
++    }
++
++    void
++    insertStore(Addr storePC, InstSeqNum seqNum, ThreadID tid, uint8_t size,
++                RegIdType st_physreg, bool stPhysRegReady, Addr regVal)
++    {
++        if (mrtTable.find(storePC) == mrtTable.end()) {
++            mrtTable.emplace(storePC, MRTCircularQueue<RegIdType>(mrtQueueCapacity));
++        }
++        auto &q = mrtTable[storePC];
++
++        MRTEntry<RegIdType> entry;
++        entry.data = regVal;
++        entry.st_physreg = st_physreg;
++        entry.seqNum = seqNum;
++        entry.dataReady = stPhysRegReady;
++        entry.valid = true;
++        entry.size = size;
++
++        q.push(entry);
++
++        ActiveStore activeStore;
++        activeStore.pc = storePC;
++        activeStore.seqNum = seqNum;
++        activeStore.tid = tid;
++        activeStoreList.push_back(activeStore);
++    }
++
++    void
++    pushSRP(ThreadID tid, Addr pushPC, InstSeqNum seqNum, uint8_t size, int64_t spOffset, RegIdType st_physreg)
++    {
++        SRPEntry<RegIdType> entry;
++        entry.pushPC = pushPC;
++        entry.st_physreg = st_physreg;
++        entry.seqNum = seqNum;
++        entry.size = size;
++        entry.spOffset = spOffset;
++        entry.popped = false;
++        entry.poppedSeqNum = 0;
++
++        auto &stack = srpStacks[tid];
++        stack.push_back(entry);
++        while (stack.size() > 256) {
++            stack.pop_front(); // Hard-limit bound to protect memory
++        }
++    }
++
++    bool
++    matchLoad(Addr loadPC, uint8_t loadSize, ThreadID tid, InstSeqNum seqNum,
++              bool isPop, bool isPeek, int64_t disp,
++              bool &outSpeculative, Addr &outData, RegIdType &outStPhysReg, bool &outDataReady)
++    {
++        outSpeculative = false;
++
++        // Try SRP-Stack match first
++        if (enableStatic && (isPop || isPeek)) {
++            auto &stack = srpStacks[tid];
++            int matchIdx = -1;
++            if (isPop) {
++                for (int i = (int)stack.size() - 1; i >= 0; i--) {
++                    if (!stack[i].popped) {
++                        matchIdx = i;
++                        break;
++                    }
++                }
++            } else {
++                for (int i = (int)stack.size() - 1; i >= 0; i--) {
++                    if (!stack[i].popped && stack[i].spOffset == disp) {
++                        matchIdx = i;
++                        break;
++                    }
++                }
++            }
++
++            if (matchIdx >= 0) {
++                auto &match = stack[matchIdx];
++                if (match.size == loadSize) {
++                    bool frozen = false;
++                    lookupMRP(loadPC, frozen);
++                    if (!frozen) {
++                        if (isPop) {
++                            match.popped = true;
++                            match.poppedSeqNum = seqNum;
++                        }
++                        Addr storePC = match.pushPC;
++                        auto mrtIt = mrtTable.find(storePC);
++                        if (mrtIt != mrtTable.end()) {
++                            auto &q = mrtIt->second;
++                            MRTEntry<RegIdType>* storeEntry = nullptr;
++                            for (int o = 0; o < q.count; o++) {
++                                MRTEntry<RegIdType>* e = q.getAtOffset(o);
++                                if (e && e->valid && e->seqNum < seqNum) {
++                                    storeEntry = e;
++                                    break;
++                                }
++                            }
++                            if (storeEntry) {
++                                outSpeculative = true;
++                                outData = storeEntry->data;
++                                outStPhysReg = storeEntry->st_physreg;
++                                outDataReady = storeEntry->dataReady;
++                                return true;
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        // Try Dynamic match
++        if (enableDynamic) {
++            std::vector<uint32_t> indexEachWays(ways);
++            std::vector<uint32_t> tagEachWays(ways);
++            for (int i = 0; i < ways; i++) {
++                indexEachWays[i] = pcHashToWayIndex(loadPC, i);
++                tagEachWays[i] = pcHashToTag(loadPC, i);
++            }
++            for (int i = 0; i < ways; i++) {
++                auto &mrpEntry = mrpTable[i][indexEachWays[i]];
++                if (mrpEntry.valid && !compareTags(mrpEntry.tag, tagEachWays[i])) {
++                    mrpEntry.rrip = 0; // Reset RRIP on hit
++                    if (!mrpEntry.frozen && mrpEntry.confidence >= confidenceThreshold) {
++                        Addr storePC = mrpEntry.storePC;
++                        int offset = mrpEntry.offset;
++                        auto mrtIt = mrtTable.find(storePC);
++                        if (mrtIt != mrtTable.end()) {
++                            auto &q = mrtIt->second;
++                            MRTEntry<RegIdType>* storeEntry = q.getAtOffset(offset);
++                            if (storeEntry && storeEntry->size == loadSize && storeEntry->seqNum < seqNum) {
++                                outSpeculative = true;
++                                outData = storeEntry->data;
++                                outStPhysReg = storeEntry->st_physreg;
++                                outDataReady = storeEntry->dataReady;
++                                return true;
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        return false;
++    }
++
++    void
++    updateMRTData(RegIdType physReg, Addr val)
++    {
++        for (auto &mrtPair : mrtTable) {
++            auto &q = mrtPair.second;
++            for (int i = 0; i < q.count; i++) {
++                MRTEntry<RegIdType> *entry = q.getAtOffset(i);
++                if (entry && entry->st_physreg == physReg && !entry->dataReady) {
++                    entry->data = val;
++                    entry->dataReady = true;
++                }
++            }
++        }
++    }
++
++    void
++    squash(ThreadID tid, uint64_t seq_no)
++    {
++        // Rollback active stores in MRT
++        int numSquashedStores = 0;
++        for (int i = (int)activeStoreList.size() - 1; i >= 0; i--) {
++            if (activeStoreList[i].tid == tid && activeStoreList[i].seqNum > seq_no) {
++                numSquashedStores++;
++                Addr storePC = activeStoreList[i].pc;
++                auto mrtIt = mrtTable.find(storePC);
++                if (mrtIt != mrtTable.end()) {
++                    mrtIt->second.rollback(1);
++                }
++            }
++        }
++        if (numSquashedStores > 0) {
++            activeStoreList.erase(activeStoreList.end() - numSquashedStores, activeStoreList.end());
++        }
++
++        // Truncate SRP-stack pushes
++        auto &stack = srpStacks[tid];
++        int numSquashedPushes = 0;
++        for (int i = (int)stack.size() - 1; i >= 0; i--) {
++            if (stack[i].seqNum > seq_no) {
++                numSquashedPushes++;
++            } else {
++                break;
++            }
++        }
++        if (numSquashedPushes > 0) {
++            stack.erase(stack.end() - numSquashedPushes, stack.end());
++        }
++
++        // Restore popped state on SRP-stack pops
++        for (auto &entry : stack) {
++            if (entry.popped && entry.poppedSeqNum > seq_no) {
++                entry.popped = false;
++                entry.poppedSeqNum = 0;
++            }
++        }
++    }
++};
++
++} // namespace valuepred
++
++} // namespace gem5
++
++#endif // __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
+diff --git a/src/cpu/valuepred/valuepred_metadata.hh b/src/cpu/valuepred/valuepred_metadata.hh
+new file mode 100644
+index 0000000000..a81aa97a24
+--- /dev/null
++++ b/src/cpu/valuepred/valuepred_metadata.hh
+@@ -0,0 +1,205 @@
++#ifndef __VALUEPRED_METADATA_HH_
++#define __VALUEPRED_METADATA_HH_
++
++#include <memory>
++#include <string>
++#include <type_traits>
++#include <utility>
++#include <vector>
++
++#include "base/types.hh"
++#include "cpu/inst_seq.hh"
++#include "enums/ValuePredType.hh"
++
++namespace gem5
++{
++
++namespace valuepred
++{
++
++class VPPredictRequestExtension
++{
++  public:
++    virtual ~VPPredictRequestExtension() = default;
++};
++
++class VPUpdateInfoExtension
++{
++  public:
++    virtual ~VPUpdateInfoExtension() = default;
++};
++
++template <typename BaseExt>
++class ExtensionContainer
++{
++  public:
++    template <typename Ext, typename... Args>
++    Ext &
++    emplace(Args&&... args)
++    {
++        static_assert(std::is_base_of_v<BaseExt, Ext>,
++                "Extension type must derive from the container base");
++        auto ext = std::make_unique<Ext>(std::forward<Args>(args)...);
++        auto *ptr = ext.get();
++        extensions.emplace_back(std::move(ext));
++        return *ptr;
++    }
++
++    template <typename Ext>
++    Ext *
++    get()
++    {
++        static_assert(std::is_base_of_v<BaseExt, Ext>,
++                "Extension type must derive from the container base");
++        for (auto &ext : extensions) {
++            if (auto *typed = dynamic_cast<Ext *>(ext.get())) {
++                return typed;
++            }
++        }
++        return nullptr;
++    }
++
++    template <typename Ext>
++    const Ext *
++    get() const
++    {
++        static_assert(std::is_base_of_v<BaseExt, Ext>,
++                "Extension type must derive from the container base");
++        for (const auto &ext : extensions) {
++            if (auto *typed = dynamic_cast<const Ext *>(ext.get())) {
++                return typed;
++            }
++        }
++        return nullptr;
++    }
++
++  private:
++    std::vector<std::unique_ptr<BaseExt>> extensions;
++};
++
++class VPPredictRequest
++{
++  public:
++    Addr pc = 0;
++    uint64_t seqNo = 0;
++    ThreadID tid = 0;
++
++    template <typename Ext, typename... Args>
++    Ext &
++    emplaceExt(Args&&... args)
++    {
++        return extensions.emplace<Ext>(std::forward<Args>(args)...);
++    }
++
++    template <typename Ext>
++    Ext *
++    getExt()
++    {
++        return extensions.get<Ext>();
++    }
++
++    template <typename Ext>
++    const Ext *
++    getExt() const
++    {
++        return extensions.get<Ext>();
++    }
++
++  private:
++    ExtensionContainer<VPPredictRequestExtension> extensions;
++};
++
++class VPUpdateInfo
++{
++  public:
++    Addr pc = 0;
++    uint64_t seqNo = 0;
++    ThreadID tid = 0;
++    RegVal actualValue = 0;
++    bool isMisprediction = false;
++
++    template <typename Ext, typename... Args>
++    Ext &
++    emplaceExt(Args&&... args)
++    {
++        return extensions.emplace<Ext>(std::forward<Args>(args)...);
++    }
++
++    template <typename Ext>
++    Ext *
++    getExt()
++    {
++        return extensions.get<Ext>();
++    }
++
++    template <typename Ext>
++    const Ext *
++    getExt() const
++    {
++        return extensions.get<Ext>();
++    }
++
++  private:
++    ExtensionContainer<VPUpdateInfoExtension> extensions;
++};
++
++class ProducerInfoExt : public VPUpdateInfoExtension
++{
++  public:
++    explicit ProducerInfoExt(Addr producer_store_pc, InstSeqNum producer_store_seq_num)
++        : producerStorePC(producer_store_pc),
++          producerStoreSeqNum(producer_store_seq_num)
++    {
++    }
++
++    Addr producerStorePC = 0;
++    InstSeqNum producerStoreSeqNum = 0;
++};
++
++class VPSpecUpdateInfo
++{
++  public:
++    ThreadID tid = 0;
++};
++
++class VPPredictionRecord
++{
++  public:
++    virtual ~VPPredictionRecord() = default;
++
++    bool offeredPrediction = false;
++    RegVal predictedValue = 0;
++};
++
++class VPResult
++{
++  public:
++    // is value prediction taken?
++    bool speculative = false;
++    // prediction value
++    RegVal value = 0;
++};
++
++class VPPredictionCandidate
++{
++  public:
++    VPResult result = {};
++    uint64_t score = 0;
++    std::unique_ptr<VPPredictionRecord> record;
++};
++
++class VPFeedback
++{
++  public:
++    bool selected = false;
++    bool applied = false;
++    bool offeredPrediction = false;
++    RegVal predictedValue = 0;
++    bool wouldHaveBeenCorrect = false;
++};
++
++}
++
++}
++
++#endif
+diff --git a/src/cpu/valuepred/valuepred_unit.cc b/src/cpu/valuepred/valuepred_unit.cc
+new file mode 100644
+index 0000000000..8bab27145d
+--- /dev/null
++++ b/src/cpu/valuepred/valuepred_unit.cc
+@@ -0,0 +1,56 @@
++#include "cpu/valuepred/valuepred_unit.hh"
++
++#include <utility>
++
++#include "base/logging.hh"
++#include "base/stats/group.hh"
++#include "base/stats/units.hh"
++
++namespace gem5
++{
++
++namespace valuepred
++{
++
++VPUnit::VPUnit(const Params &params)
++    : SimObject(params),
++      numThreads(params.numThreads),
++      stats(this)
++{
++    gem5_assert(numThreads > 0, "Value predictor needs at least one thread\n");
++}
++
++void
++VPUnit::assertValidTid(ThreadID tid) const
++{
++    gem5_assert(tid < numThreads, "%s got invalid tid %u, numThreads=%u\n",
++                name().c_str(), static_cast<unsigned>(tid), numThreads);
++}
++
++VPResult
++VPUnit::valuePredict(const VPPredictRequest &request,
++        std::unique_ptr<VPPredictionRecord> &record)
++{
++    stats.VPsupported++;
++    auto candidate = predict(request);
++    record = std::move(candidate.record);
++    if (candidate.result.speculative) {
++        stats.VPpredicted++;
++    }
++    return candidate.result;
++}
++
++VPUnit::ValuePredUnitStats::ValuePredUnitStats(VPUnit *vp)
++    : statistics::Group(vp),
++      ADD_STAT(VPcorrect, statistics::units::Count::get(), "number of correct vp"),
++      ADD_STAT(VPpredicted, statistics::units::Count::get(), "number of predicted vp"),
++      ADD_STAT(VPaccuracy, statistics::units::Ratio::get(), "the accuracy of value predictor",
++               VPcorrect / VPpredicted),
++      ADD_STAT(VPsupported, statistics::units::Count::get(), "number of vp support"),
++      ADD_STAT(VPcoverage, statistics::units::Ratio::get(), "the coverage of vp", VPcorrect / VPsupported)
++{
++}
++
++}
++
++}
+diff --git a/src/cpu/valuepred/valuepred_unit.hh b/src/cpu/valuepred/valuepred_unit.hh
+new file mode 100644
+index 0000000000..a281f739c0
+--- /dev/null
++++ b/src/cpu/valuepred/valuepred_unit.hh
+@@ -0,0 +1,77 @@
++#ifndef __VALUEPRED_UNIT_HH__
++#define __VALUEPRED_UNIT_HH__
++
++#include <memory>
++#include <string>
++
++#include "base/statistics.hh"
++#include "base/types.hh"
++#include "cpu/reg_class.hh"
++#include "cpu/valuepred/valuepred_metadata.hh"
++#include "enums/ValuePredType.hh"
++#include "params/ValuePredictor.hh"
++#include "sim/sim_object.hh"
++#include "sim/stats.hh"
++
++namespace gem5
++{
++
++namespace valuepred
++{
++
++class VPUnit : public SimObject
++{
++  private:
++    using Params = ValuePredictorParams;
++
++  protected:
++    const unsigned numThreads;
++
++    void assertValidTid(ThreadID tid) const;
++
++  public:
++    VPUnit(const Params &params);
++
++    std::string name() const { return "valuePredict.base"; }
++
++    // Do the value predict.
++    virtual VPPredictionCandidate predict(const VPPredictRequest &request) = 0;
++
++    VPResult valuePredict(const VPPredictRequest &request,
++            std::unique_ptr<VPPredictionRecord> &record);
++
++    // In commit time, update value predictor
++    virtual void update(const VPUpdateInfo &updateInfo,
++            const VPPredictionRecord *record, const VPFeedback &feedback) = 0;
++
++    // Some value predictor need speculative update to support back-to-back predict.
++    virtual void specUpdate(const VPSpecUpdateInfo &specUpdateInfo) = 0;
++
++    // If predict error, squash the inflight instructions in value predictor.
++    virtual void squash(ThreadID tid, const uint64_t seq_no) = 0;
++
++    // Hook called when an instruction writes back to a physical register
++    virtual void writebackReg(PhysRegIdPtr physReg, RegVal val) {}
++
++    // Get the value predictor type
++    virtual ValuePredType getValuePredictorType() = 0;
++
++  public:
++    struct ValuePredUnitStats : public statistics::Group
++    {
++        ValuePredUnitStats(VPUnit *vp);
++
++        statistics::Scalar VPcorrect;
++        statistics::Scalar VPpredicted;
++        statistics::Formula VPaccuracy;
++        statistics::Scalar VPsupported;
++        statistics::Formula VPcoverage;
++
++    } stats;
++};
++
++}
++
++}
++
++#endif

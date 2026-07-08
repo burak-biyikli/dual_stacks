@@ -16,12 +16,29 @@ if [ "$ACTION" == "update" ]; then
             MODULE_NAME=$(basename "$d")
             cd "$d" || continue
             
-            # Use git diff HEAD to capture all uncommitted changes (staged and unstaged)
-            git diff HEAD > "$PATCH_DIR/${MODULE_NAME}.patch"
+            # Ensure it is a git repository
+            if [ -d .git ] || [ -f .git ]; then
+                # Temporary file to store untracked files list
+                TMP_UNTRACKED="../.tmp_untracked_${MODULE_NAME}"
+                git ls-files -z --others --exclude-standard > "$TMP_UNTRACKED"
+                
+                # If there are untracked files, mark them as intent-to-add so they are captured by git diff HEAD
+                if [ -s "$TMP_UNTRACKED" ]; then
+                    xargs -0 git add -N < "$TMP_UNTRACKED"
+                    git diff HEAD > "$PATCH_DIR/${MODULE_NAME}.patch"
+                    xargs -0 git reset > /dev/null < "$TMP_UNTRACKED"
+                else
+                    git diff HEAD > "$PATCH_DIR/${MODULE_NAME}.patch"
+                fi
+                rm -f "$TMP_UNTRACKED"
+            else
+                echo "Warning: $MODULE_NAME is not a git repository. Skipping."
+                continue
+            fi
             
             # If the patch is empty, remove it
             if [ ! -s "$PATCH_DIR/${MODULE_NAME}.patch" ]; then
-                rm "$PATCH_DIR/${MODULE_NAME}.patch"
+                rm -f "$PATCH_DIR/${MODULE_NAME}.patch"
                 echo "No changes found in $MODULE_NAME."
             else
                 echo "Updated $PATCH_DIR/${MODULE_NAME}.patch"
