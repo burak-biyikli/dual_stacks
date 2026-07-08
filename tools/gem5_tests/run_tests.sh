@@ -76,10 +76,10 @@ for test_dir in */; do
 
                 # 2. Run Simulations
                 set +e
-                "$GEM5_BIN" --debug-flags=Exec --debug-file=trace_stock.txt --outdir="$out_dir" "$ROOT_DIR/configs/run_o3_stock.py" "$bin_file" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
+                "$GEM5_BIN" --debug-flags=Exec --debug-file=trace_stock.txt --stats-file=stats_stock.txt --outdir="$out_dir" "$ROOT_DIR/configs/run_o3_stock.py" "$bin_file" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
                 stock_status=$?
                 
-                "$GEM5_BIN" --debug-flags=Exec --debug-file=trace_mr.txt --outdir="$out_dir" "$ROOT_DIR/configs/run_o3_mr.py" "$bin_file" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
+                "$GEM5_BIN" --debug-flags=Exec --debug-file=trace_mr.txt --stats-file=stats_mr.txt --outdir="$out_dir" "$ROOT_DIR/configs/run_o3_mr.py" "$bin_file" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
                 mr_status=$?
                 set -e
                 
@@ -91,7 +91,17 @@ for test_dir in */; do
                     continue
                 fi
                 
-                # 3. Parse & Diff Traces
+                # 3. Check Stats
+                stats_failed=0
+                "$SCRIPT_DIR/check_stats.py" "stock" "$test_name" "$out_dir/stats_stock.txt" || stats_failed=1
+                "$SCRIPT_DIR/check_stats.py" "mr" "$test_name" "$out_dir/stats_mr.txt" || stats_failed=1
+                
+                if [ $stats_failed -eq 1 ]; then
+                    FAILURES=$((FAILURES + 1))
+                    continue
+                fi
+                
+                # 4. Parse & Diff Traces
                 "$SCRIPT_DIR/parse_traces.py" "$trace_stock" "$clean_stock" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
                 "$SCRIPT_DIR/parse_traces.py" "$trace_mr" "$clean_mr" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
                 

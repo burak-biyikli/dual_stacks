@@ -74,7 +74,7 @@ index 192f73da2e..8bce754d46 100644
  
  /** Struct that defines all backwards communication. */
 diff --git a/src/cpu/o3/commit.cc b/src/cpu/o3/commit.cc
-index 405ea09d64..8a204a7fc4 100644
+index 405ea09d64..50140eb5fc 100644
 --- a/src/cpu/o3/commit.cc
 +++ b/src/cpu/o3/commit.cc
 @@ -63,6 +63,7 @@
@@ -95,7 +95,15 @@ index 405ea09d64..8a204a7fc4 100644
  {
      if (commitWidth > MaxWidth)
          fatal("commitWidth (%d) is larger than compiled limit (%d),\n"
-@@ -1037,6 +1039,30 @@ Commit::commitInsts()
+@@ -139,6 +141,7 @@ Commit::Commit(CPU *_cpu, const BaseO3CPUParams &params)
+         trapSquash[tid] = false;
+         tcSquash[tid] = false;
+         squashAfterInst[tid] = nullptr;
++        valuePredictionSquash[tid] = false;
+         pc[tid].reset(params.isa[0]->newPCState());
+         youngestSeqNum[tid] = 0;
+         lastCommitedSeqNum[tid] = 0;
+@@ -1037,6 +1040,37 @@ Commit::commitInsts()
                  // Keep track of the last sequence number commited
                  lastCommitedSeqNum[tid] = head_inst->seqNum;
  
@@ -120,14 +128,35 @@ index 405ea09d64..8a204a7fc4 100644
 +                        }
 +                        valuepred::VPFeedback feedback;
 +                        valuePred->update(updateInfo, head_inst->vpRecord.get(), feedback);
++                        if (head_inst->vpResult.speculative && !head_inst->vpMisprediction) {
++                            valuePred->stats.VPcorrect++;
++                        }
 +                    }
++                }
++
++                if (head_inst->vpMisprediction) {
++                    valuePredictionSquash[tid] = true;
 +                }
 +
                  // If this is an instruction that doesn't play nicely with
                  // others squash everything and restart fetch
                  if (head_inst->isSquashAfter())
+@@ -1060,6 +1094,13 @@ Commit::commitInsts()
+                                       !head_inst->isDelayedCommit();
+ 
+                 if (onInstBoundary) {
++                    if (valuePredictionSquash[tid]) {
++                        DPRINTF(Commit, "[tid:%i] Squashing after value misprediction [sn:%llu]\n",
++                                tid, head_inst->seqNum);
++                        squashAfter(tid, head_inst);
++                        valuePredictionSquash[tid] = false;
++                    }
++
+                     int count = 0;
+                     Addr oldpc;
+                     // Make sure we're not currently updating state while
 diff --git a/src/cpu/o3/commit.hh b/src/cpu/o3/commit.hh
-index 5f978c8c5d..febda9f3fc 100644
+index 5f978c8c5d..16199f50b0 100644
 --- a/src/cpu/o3/commit.hh
 +++ b/src/cpu/o3/commit.hh
 @@ -52,6 +52,7 @@
@@ -138,7 +167,17 @@ index 5f978c8c5d..febda9f3fc 100644
  #include "cpu/timebuf.hh"
  #include "enums/CommitPolicy.hh"
  #include "sim/probe/probe.hh"
-@@ -446,6 +447,8 @@ class Commit
+@@ -374,6 +375,9 @@ class Commit
+      */
+     DynInstPtr squashAfterInst[MaxThreads];
+ 
++    /** Records if a thread has to squash due to a value prediction error. */
++    bool valuePredictionSquash[MaxThreads];
++
+     /** Priority List used for Commit Policy */
+     std::list<ThreadID> priority_list;
+ 
+@@ -446,6 +450,8 @@ class Commit
      /** Rename map interface. */
      UnifiedRenameMap *renameMap[MaxThreads];
  
@@ -288,7 +327,7 @@ index f0c14fb177..d2474e4868 100644
  
  } // namespace o3
 diff --git a/src/cpu/o3/iew.cc b/src/cpu/o3/iew.cc
-index d5be814468..46ebfb181a 100644
+index d5be814468..57252b260e 100644
 --- a/src/cpu/o3/iew.cc
 +++ b/src/cpu/o3/iew.cc
 @@ -88,7 +88,8 @@ IEW::IEW(CPU *_cpu, const BaseO3CPUParams &params)
@@ -319,6 +358,7 @@ index d5be814468..46ebfb181a 100644
 +    DPRINTF(IEW, "[tid:%i] value prediction error, squashing violator and younger "
 +            "insts, PC: %s [sn:%llu].\n",
 +            tid, inst->pcState(), inst->seqNum);
++    fetchRedirect[tid] = true;
 +    if (!toCommit->squash[tid] || inst->seqNum < toCommit->squashedSeqNum[tid]) {
 +        toCommit->squash[tid] = true;
 +
@@ -355,7 +395,6 @@ index d5be814468..46ebfb181a 100644
 +
 +        DPRINTF(IEW, "[sn:%llu] vp set scoreboard to true\n", inst->seqNum);
 +    }
-+    instQueue.wakeDependents(inst);
 +}
 +
  void
@@ -386,7 +425,7 @@ index d5be814468..46ebfb181a 100644
                              inst->renamedDestIdx(i)->index(),
                              inst->renamedDestIdx(i)->className());
                      scoreboard->setReg(inst->renamedDestIdx(i));
-+                    if (valuePred) {
++                    if (valuePred && !inst->renamedDestIdx(i)->is(InvalidRegClass)) {
 +                        RegVal val = cpu->getReg(inst->renamedDestIdx(i), inst->threadNumber);
 +                        valuePred->writebackReg(inst->renamedDestIdx(i), val);
 +                    }
@@ -394,7 +433,7 @@ index d5be814468..46ebfb181a 100644
              }
  
 diff --git a/src/cpu/o3/iew.hh b/src/cpu/o3/iew.hh
-index c62a3dc835..f1027fe5b9 100644
+index c62a3dc835..e5bfdd0868 100644
 --- a/src/cpu/o3/iew.hh
 +++ b/src/cpu/o3/iew.hh
 @@ -51,6 +51,7 @@
@@ -405,16 +444,24 @@ index c62a3dc835..f1027fe5b9 100644
  #include "cpu/timebuf.hh"
  #include "debug/IEW.hh"
  #include "sim/probe/probe.hh"
-@@ -250,6 +251,8 @@ class IEW
+@@ -142,6 +143,8 @@ class IEW
+     /** Clear all thread-specific states */
+     void clearStates(ThreadID tid);
+ 
++    void squashDueToValuePrediction(const DynInstPtr &inst, ThreadID tid);
++
+     /** Sets main time buffer used for backwards communication. */
+     void setTimeBuffer(TimeBuffer<TimeStruct> *tb_ptr);
+ 
+@@ -250,6 +253,7 @@ class IEW
       * violation.
       */
      void squashDueToMemOrder(const DynInstPtr &inst, ThreadID tid);
-+    void squashDueToValuePrediction(const DynInstPtr &inst, ThreadID tid);
 +    void lvpWakeDependents(const DynInstPtr &inst);
  
      /** Sets Dispatch to blocked, and signals back to other stages to block. */
      void block(ThreadID tid);
-@@ -342,6 +345,8 @@ class IEW
+@@ -342,6 +346,8 @@ class IEW
      /** Scoreboard pointer. */
      Scoreboard* scoreboard;
  
@@ -424,7 +471,7 @@ index c62a3dc835..f1027fe5b9 100644
      /** CPU pointer. */
      CPU *cpu;
 diff --git a/src/cpu/o3/lsq_unit.cc b/src/cpu/o3/lsq_unit.cc
-index 67ae69237e..ece3666a60 100644
+index 67ae69237e..1a067c3759 100644
 --- a/src/cpu/o3/lsq_unit.cc
 +++ b/src/cpu/o3/lsq_unit.cc
 @@ -47,6 +47,7 @@
@@ -435,7 +482,7 @@ index 67ae69237e..ece3666a60 100644
  #include "debug/Activity.hh"
  #include "debug/HtmCpu.hh"
  #include "debug/IEW.hh"
-@@ -1114,6 +1115,23 @@ LSQUnit::writeback(const DynInstPtr &inst, PacketPtr pkt)
+@@ -1114,6 +1115,26 @@ LSQUnit::writeback(const DynInstPtr &inst, PacketPtr pkt)
          if (inst->fault == NoFault) {
              // Complete access to copy data to proper place.
              inst->completeAcc(pkt);
@@ -447,19 +494,22 @@ index 67ae69237e..ece3666a60 100644
 +                }
 +            }
 +
-+            if (inst->canLVP() && inst->getFault() == NoFault) {
-+                RegVal real_val = cpu->getReg(inst->renamedDestIdx(0), inst->threadNumber);
-+                inst->actualValue = real_val;
-+                if (inst->vpResult.speculative) {
-+                    if (real_val != inst->vpResult.value) {
-+                        inst->vpMisprediction = true;
++            if (inst->canLVP() && inst->getFault() == NoFault && inst->numDestRegs() > 0) {
++                auto dest_reg = inst->renamedDestIdx(0);
++                if (dest_reg && !dest_reg->is(InvalidRegClass)) {
++                    RegVal real_val = cpu->getReg(dest_reg, inst->threadNumber);
++                    inst->actualValue = real_val;
++                    if (inst->vpResult.speculative) {
++                        if (real_val != inst->vpResult.value) {
++                            inst->vpMisprediction = true;
++                        }
 +                    }
 +                }
 +            }
          } else {
              // If the instruction has an outstanding fault, we cannot complete
              // the access as this discards the current fault.
-@@ -1547,6 +1565,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
+@@ -1547,6 +1568,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
  
                  // Don't need to do anything special for split loads.
                  ++stats.forwLoads;
@@ -469,7 +519,7 @@ index 67ae69237e..ece3666a60 100644
                  return NoFault;
              } else if (
 diff --git a/src/cpu/o3/rename.cc b/src/cpu/o3/rename.cc
-index f783e0baad..c99b6b3058 100644
+index f783e0baad..0d6db1f3ae 100644
 --- a/src/cpu/o3/rename.cc
 +++ b/src/cpu/o3/rename.cc
 @@ -46,6 +46,7 @@
@@ -501,7 +551,7 @@ index f783e0baad..c99b6b3058 100644
      // Clear the stall signal if rename was blocked or unblocking before.
      // If it still needs to block, the blocking should happen the next
      // cycle and there should be space to hold everything due to the squash.
-@@ -745,6 +751,21 @@ Rename::renameInsts(ThreadID tid)
+@@ -745,6 +751,29 @@ Rename::renameInsts(ThreadID tid)
  
          renameDestRegs(inst, inst->threadNumber);
  
@@ -509,8 +559,16 @@ index f783e0baad..c99b6b3058 100644
 +            auto *mr = dynamic_cast<valuepred::MemoryRenaming*>(valuePred);
 +            if (mr) {
 +                if (inst->isStore()) {
-+                    if (inst->numSrcRegs() > 0) {
-+                        mr->renameStore(inst, inst->renamedSrcIdx(0));
++                    PhysRegIdPtr st_physreg = nullptr;
++                    for (int i = inst->numSrcRegs() - 1; i >= 0; i--) {
++                        PhysRegIdPtr reg = inst->renamedSrcIdx(i);
++                        if (reg && !reg->is(InvalidRegClass) && (reg->is(IntRegClass) || reg->is(FloatRegClass))) {
++                            st_physreg = reg;
++                            break;
++                        }
++                    }
++                    if (st_physreg) {
++                        mr->renameStore(inst, st_physreg);
 +                    }
 +                } else if (inst->isLoad()) {
 +                    if (inst->numDestRegs() > 0) {
