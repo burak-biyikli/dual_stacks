@@ -21,8 +21,8 @@ _start:
     movq $127, %r10
     movq $511, %r11
 
-    # Use rcx as loop counter, 400 iters
-    movq $400, %rcx
+    # Use rcx as loop counter, compared against 400 below
+    movq $0, %rcx
 
 loop_start:
 
@@ -34,14 +34,14 @@ loop_start:
     movq %r11, (%r9)
 
 
-    # When RCX & 0xF == 0xF (Every 16th iteration) we swap the pointers and
+    # When RCX & 0x7 == 0x7 (Every 8th iteration) we swap the pointers and
     # expected data. The swap will switch which stores the loads rely on,
     # causing many squashes/failed predictions. Depending on implementation
     # The swap in ST->LD dependency may reset the tracking for subsequent loops
     # or the LD PC may be marked unstable until evicted from the predictor.
     movq %rcx, %rax
-    andq $0x0F, %rax
-    cmpq $0x0F, %rax
+    andq $0x07, %rax
+    cmpq $0x07, %rax
     jne no_swap
 do_swap:
     # Swap pointers and expected data
@@ -77,8 +77,9 @@ no_swap:
     cmp %r15, %r11
     jne fail
 
-    #Equivlent to `if ((--rcx) != 0 ) goto loop_start;`
-    dec %rcx
+    #Equivlent to `if ((++rcx) != 400 ) goto loop_start;`
+    incq %rcx
+    cmp $400, %rcx
     jne loop_start
 
     #End of loop with no errors, return 0
