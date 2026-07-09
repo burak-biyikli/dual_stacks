@@ -74,7 +74,7 @@ index 192f73da2e..8bce754d46 100644
  
  /** Struct that defines all backwards communication. */
 diff --git a/src/cpu/o3/commit.cc b/src/cpu/o3/commit.cc
-index 405ea09d64..50140eb5fc 100644
+index 405ea09d64..31c0758c92 100644
 --- a/src/cpu/o3/commit.cc
 +++ b/src/cpu/o3/commit.cc
 @@ -63,6 +63,7 @@
@@ -103,7 +103,7 @@ index 405ea09d64..50140eb5fc 100644
          pc[tid].reset(params.isa[0]->newPCState());
          youngestSeqNum[tid] = 0;
          lastCommitedSeqNum[tid] = 0;
-@@ -1037,6 +1040,37 @@ Commit::commitInsts()
+@@ -1037,6 +1040,42 @@ Commit::commitInsts()
                  // Keep track of the last sequence number commited
                  lastCommitedSeqNum[tid] = head_inst->seqNum;
  
@@ -112,7 +112,10 @@ index 405ea09d64..50140eb5fc 100644
 +                    if (head_inst->isStore() && !head_inst->isSquashed()) {
 +                        auto *mr = dynamic_cast<valuepred::MemoryRenaming*>(valuePred);
 +                        if (mr) {
-+                            mr->commitStore(head_inst->pcState().instAddr(), head_inst->seqNum);
++                            mr->commitStore(head_inst->pcState().instAddr(),
++                                            head_inst->seqNum,
++                                            head_inst->physEffAddr,
++                                            head_inst->effSize);
 +                        }
 +                    } else if (head_inst->canLVP() && !head_inst->isSquashed() && (head_inst->getFault() == NoFault)) {
 +                        valuepred::VPUpdateInfo updateInfo;
@@ -120,6 +123,8 @@ index 405ea09d64..50140eb5fc 100644
 +                        updateInfo.seqNo = head_inst->seqNum;
 +                        updateInfo.tid = tid;
 +                        updateInfo.actualValue = head_inst->actualValue;
++                        updateInfo.physAddr = head_inst->physEffAddr;
++                        updateInfo.accessSize = head_inst->effSize;
 +                        if (head_inst->hasProducerStorePC()) {
 +                            updateInfo.emplaceExt<valuepred::ProducerInfoExt>(
 +                                head_inst->producerStorePC(),
@@ -141,7 +146,7 @@ index 405ea09d64..50140eb5fc 100644
                  // If this is an instruction that doesn't play nicely with
                  // others squash everything and restart fetch
                  if (head_inst->isSquashAfter())
-@@ -1060,6 +1094,13 @@ Commit::commitInsts()
+@@ -1060,6 +1099,13 @@ Commit::commitInsts()
                                        !head_inst->isDelayedCommit();
  
                  if (onInstBoundary) {
@@ -643,10 +648,10 @@ index 0000000000..25aa51554c
 +
 diff --git a/src/cpu/valuepred/ValuePredictor.py b/src/cpu/valuepred/ValuePredictor.py
 new file mode 100644
-index 0000000000..4c12d5fbac
+index 0000000000..faa7b6f156
 --- /dev/null
 +++ b/src/cpu/valuepred/ValuePredictor.py
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,35 @@
 +from m5.params import *
 +from m5.proxy import *
 +from m5.SimObject import *
@@ -677,16 +682,17 @@ index 0000000000..4c12d5fbac
 +    reallocationConfidence = Param.Int(1, "starting confidence when a load changes its producer store PC")
 +    demotionPenalty = Param.Int(1, "Demotion penalty for wrong prediction or missing store")
 +    mrtQueueCapacity = Param.Int(8, "Capacity of each circular queue in the MRT")
++    committedStoreQueueCapacity = Param.Int(512, "Depth of the retired store FIFO (RS-FIFO) used for commit-time overlap detection")
 +
 +    # Path enables
 +    enableDynamic = Param.Bool(True, "Enable dynamic Memory Renaming path (MRP)")
 +    enableStatic = Param.Bool(True, "Enable static Memory Renaming path (SRP)")
 diff --git a/src/cpu/valuepred/memory_renaming.cc b/src/cpu/valuepred/memory_renaming.cc
 new file mode 100644
-index 0000000000..a868094bc3
+index 0000000000..1f93afcf54
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.cc
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,272 @@
 +#include "cpu/valuepred/memory_renaming.hh"
 +
 +#include <algorithm>
@@ -708,7 +714,8 @@ index 0000000000..a868094bc3
 +      core(params.ways, 1 << params.logESTBEntrys, params.tagWidth, params.logESTBEntrys,
 +           params.logMaxConfidence, params.predictionThreshold,
 +           params.allocationConfidence, params.reallocationConfidence,
-+           params.demotionPenalty, params.mrtQueueCapacity, params.enableDynamic,
++           params.demotionPenalty, params.mrtQueueCapacity,
++           params.committedStoreQueueCapacity, params.enableDynamic,
 +           params.enableStatic, params.numThreads)
 +{
 +    uint64_t maxThreshold = (1ULL << params.logMaxConfidence) - 1;
@@ -843,9 +850,9 @@ index 0000000000..a868094bc3
 +}
 +
 +void
-+MemoryRenaming::commitStore(Addr pc, InstSeqNum seqNum)
++MemoryRenaming::commitStore(Addr pc, InstSeqNum seqNum, Addr physAddr, uint8_t size)
 +{
-+    core.commitStore(pc, seqNum);
++    core.commitStore(pc, seqNum, physAddr, size);
 +}
 +
 +void
@@ -867,7 +874,19 @@ index 0000000000..a868094bc3
 +            core.trainMRP(loadPC, 0, 0, false);
 +        }
 +    } else {
-+        core.trainMRP(loadPC, 0, 0, false);
++        auto match = core.findForwardingStore(updateInfo.physAddr,
++                                              updateInfo.accessSize,
++                                              updateInfo.seqNo);
++        if (match.found) {
++            int offset = core.getProducerOffset(match.storeSeqNum, match.storePC);
++            if (offset >= 0) {
++                core.trainMRP(loadPC, match.storePC, offset, true);
++            } else {
++                core.trainMRP(loadPC, 0, 0, false);
++            }
++        } else {
++            core.trainMRP(loadPC, 0, 0, false);
++        }
 +    }
 +
 +    core.retireSRP(updateInfo.tid, updateInfo.seqNo);
@@ -948,7 +967,7 @@ index 0000000000..a868094bc3
 +} // namespace gem5
 diff --git a/src/cpu/valuepred/memory_renaming.hh b/src/cpu/valuepred/memory_renaming.hh
 new file mode 100644
-index 0000000000..9664cb134f
+index 0000000000..b1f3bf477a
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.hh
 @@ -0,0 +1,75 @@
@@ -1016,7 +1035,7 @@ index 0000000000..9664cb134f
 +    void renameLoad(const gem5::o3::DynInstPtr &inst, PhysRegIdPtr ld_physreg);
 +
 +    // Commit-stage custom hooks
-+    void commitStore(Addr pc, InstSeqNum seqNum);
++    void commitStore(Addr pc, InstSeqNum seqNum, Addr physAddr = 0, uint8_t size = 0);
 +
 +    // LSQ completion hook
 +    void completeLoadLSU(const gem5::o3::DynInstPtr &inst);
@@ -1029,10 +1048,10 @@ index 0000000000..9664cb134f
 +#endif // __CPU_VALUEPRED_MEMORY_RENAMING_HH__
 diff --git a/src/cpu/valuepred/memory_renaming.test.cc b/src/cpu/valuepred/memory_renaming.test.cc
 new file mode 100644
-index 0000000000..4104e926b0
+index 0000000000..ba9fa89c8a
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.test.cc
-@@ -0,0 +1,669 @@
+@@ -0,0 +1,716 @@
 +#include <gtest/gtest.h>
 +#include <random>
 +#include <vector>
@@ -1059,6 +1078,7 @@ index 0000000000..4104e926b0
 +            1,      // reallocationConfidence
 +            1,      // demotionPenalty
 +            8,      // mrtQueueCapacity
++            512,    // committedStoreQueueCapacity
 +            true,   // enableDynamic
 +            true,   // enableStatic
 +            1       // numThreads
@@ -1145,7 +1165,7 @@ index 0000000000..4104e926b0
 +TEST_F(MemoryRenamingCoreTest, MRPReallocationConfidenceFreezesOnPCChange)
 +{
 +    auto core = new MemoryRenamingCore<int>(
-+        4, 1024, 16, 10, 2, 2, 1, 0, 1, 8, true, true, 1);
++        4, 1024, 16, 10, 2, 2, 1, 0, 1, 8, 512, true, true, 1);
 +
 +    Addr loadPC = 0x1000;
 +    Addr storePC1 = 0x2000;
@@ -1192,6 +1212,7 @@ index 0000000000..4104e926b0
 +        1,      // reallocationConfidence
 +        3,      // demotionPenalty
 +        8,      // mrtQueueCapacity
++        512,    // committedStoreQueueCapacity
 +        true,   // enableDynamic
 +        true,   // enableStatic
 +        1       // numThreads
@@ -1264,6 +1285,7 @@ index 0000000000..4104e926b0
 +        1,      // reallocationConfidence
 +        1,      // demotionPenalty
 +        8,      // mrtQueueCapacity
++        512,    // committedStoreQueueCapacity
 +        true,   // enableDynamic
 +        true,   // enableStatic
 +        1       // numThreads
@@ -1353,6 +1375,7 @@ index 0000000000..4104e926b0
 +        1,      // reallocationConfidence
 +        1,      // demotionPenalty
 +        8,      // mrtQueueCapacity
++        512,    // committedStoreQueueCapacity
 +        true,   // enableDynamic
 +        true,   // enableStatic
 +        1       // numThreads
@@ -1627,6 +1650,49 @@ index 0000000000..4104e926b0
 +    delete core;
 +}
 +
++TEST_F(MemoryRenamingCoreTest, RSFIFOFindForwardingStore)
++{
++    auto core = createDefaultCore();
++    Addr storePC = 0x1000;
++    Addr loadAddr = 0x5000;
++
++    core->commitStore(storePC, 10, loadAddr, 8);
++    core->commitStore(0x1100, 12, 0x6000, 8);
++
++    auto match = core->findForwardingStore(loadAddr, 8, 15);
++    EXPECT_TRUE(match.found);
++    EXPECT_EQ(match.storePC, storePC);
++    EXPECT_EQ(match.storeSeqNum, 10u);
++
++    auto sizeMismatch = core->findForwardingStore(loadAddr, 4, 15);
++    EXPECT_FALSE(sizeMismatch.found);
++
++    auto addrMismatch = core->findForwardingStore(0x7000, 8, 15);
++    EXPECT_FALSE(addrMismatch.found);
++
++    delete core;
++}
++
++TEST_F(MemoryRenamingCoreTest, RSFIFOCapacityEviction)
++{
++    auto core = new MemoryRenamingCore<int>(
++        4, 1024, 16, 10, 2, 2, 1, 1, 1, 8, 3, true, true, 1);
++
++    for (InstSeqNum sn = 1; sn <= 5; sn++) {
++        core->commitStore(0x1000 + sn, sn, 0x5000 + sn, 8);
++    }
++
++    EXPECT_EQ(core->committedStoreQueue.size(), 3u);
++    auto match = core->findForwardingStore(0x5001, 8, 10);
++    EXPECT_FALSE(match.found);
++
++    match = core->findForwardingStore(0x5003, 8, 10);
++    EXPECT_TRUE(match.found);
++    EXPECT_EQ(match.storeSeqNum, 3u);
++
++    delete core;
++}
++
 +TEST_F(MemoryRenamingCoreTest, DynamicPathSizeMismatchSuppression)
 +{
 +    auto core = createDefaultCore();
@@ -1704,10 +1770,10 @@ index 0000000000..4104e926b0
 +
 diff --git a/src/cpu/valuepred/memory_renaming_commit_pipeline.test.cc b/src/cpu/valuepred/memory_renaming_commit_pipeline.test.cc
 new file mode 100644
-index 0000000000..ca5c670967
+index 0000000000..3f83af734d
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_commit_pipeline.test.cc
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,218 @@
 +#include <gtest/gtest.h>
 +
 +#include "cpu/valuepred/memory_renaming_pipeline_harness.hh"
@@ -1792,6 +1858,31 @@ index 0000000000..ca5c670967
 +    auto result = commit->commitLoad(loadPC, 14, false, 0, 0, true, false);
 +    EXPECT_TRUE(result.demoted);
 +    EXPECT_EQ(mrpConfidence(loadPC), 0);
++}
++
++TEST_F(CommitPipelineTest, LoadTrainingViaRSFIFO)
++{
++    Addr loadPC = 0x3000;
++    Addr storePC = 0x2000;
++    Addr memAddr = 0x5000;
++
++    commit->commitStore(storePC, 10, memAddr, 8);
++    auto result = commit->commitLoad(loadPC, 12, false, 0, 0, true, false,
++                                     0, 0, memAddr, 8);
++    EXPECT_TRUE(result.trained);
++    EXPECT_EQ(result.producerOffset, 0);
++    EXPECT_EQ(mrpConfidence(loadPC), 1);
++}
++
++TEST_F(CommitPipelineTest, LoadTrainingNoRSFIFOMatchDemotes)
++{
++    Addr loadPC = 0x3000;
++
++    commit->commitStore(0x2000, 10, 0x5000, 8);
++    auto result = commit->commitLoad(loadPC, 12, false, 0, 0, true, false,
++                                     0, 0, 0x6000, 8);
++    EXPECT_TRUE(result.demoted);
++    EXPECT_EQ(mrpConfidence(loadPC), -1);
 +}
 +
 +TEST_F(CommitPipelineTest, LoadTrainingUnknownProducerDemotes)
@@ -1903,10 +1994,10 @@ index 0000000000..ca5c670967
 +}
 diff --git a/src/cpu/valuepred/memory_renaming_core.hh b/src/cpu/valuepred/memory_renaming_core.hh
 new file mode 100644
-index 0000000000..4b59216290
+index 0000000000..a2d6b4921d
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_core.hh
-@@ -0,0 +1,581 @@
+@@ -0,0 +1,622 @@
 +#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 +#define __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 +
@@ -2011,6 +2102,15 @@ index 0000000000..4b59216290
 +{
 +    Addr pc = 0;
 +    InstSeqNum seqNum = 0;
++    Addr physAddr = 0;
++    uint8_t size = 0;
++};
++
++struct RSFIFOMatch
++{
++    bool found = false;
++    Addr storePC = 0;
++    InstSeqNum storeSeqNum = 0;
 +};
 +
 +/** Result of decoding whether a memory uop targets the private stack. */
@@ -2071,6 +2171,7 @@ index 0000000000..4b59216290
 +    const int reallocationConfidence;
 +    const int demotionPenalty;
 +    const int mrtQueueCapacity;
++    const int committedStoreQueueCapacity;
 +    const bool enableDynamic;
 +    const bool enableStatic;
 +
@@ -2084,7 +2185,8 @@ index 0000000000..4b59216290
 +    MemoryRenamingCore(int _ways, int _entryCounts, int _tagWidth, int _logESTBEntrys,
 +                       int _logMaxConfidence, int _confidenceThreshold,
 +                       int _allocationConfidence, int _reallocationConfidence,
-+                       int _demotionPenalty, int _mrtQueueCapacity, bool _enableDynamic,
++                       int _demotionPenalty, int _mrtQueueCapacity,
++                       int _committedStoreQueueCapacity, bool _enableDynamic,
 +                       bool _enableStatic, int numThreads)
 +        : ways(_ways), entryCounts(_entryCounts), tagWidth(_tagWidth), logESTBEntrys(_logESTBEntrys),
 +          logMaxConfidence(_logMaxConfidence), MAXCONFIDENCE((1 << _logMaxConfidence) - 1),
@@ -2092,7 +2194,9 @@ index 0000000000..4b59216290
 +          allocationConfidence(_allocationConfidence),
 +          reallocationConfidence(_reallocationConfidence),
 +          demotionPenalty(_demotionPenalty),
-+          mrtQueueCapacity(_mrtQueueCapacity), enableDynamic(_enableDynamic), enableStatic(_enableStatic)
++          mrtQueueCapacity(_mrtQueueCapacity),
++          committedStoreQueueCapacity(_committedStoreQueueCapacity),
++          enableDynamic(_enableDynamic), enableStatic(_enableStatic)
 +    {
 +        mrpTable.resize(ways);
 +        for (auto &table : mrpTable) {
@@ -2238,13 +2342,15 @@ index 0000000000..4b59216290
 +    }
 +
 +    void
-+    commitStore(Addr pc, InstSeqNum seqNum)
++    commitStore(Addr pc, InstSeqNum seqNum, Addr physAddr = 0, uint8_t size = 0)
 +    {
 +        CommittedStore entry;
 +        entry.pc = pc;
 +        entry.seqNum = seqNum;
++        entry.physAddr = physAddr;
++        entry.size = size;
 +        committedStoreQueue.push_back(entry);
-+        while (committedStoreQueue.size() > 512) {
++        while ((int)committedStoreQueue.size() > committedStoreQueueCapacity) {
 +            committedStoreQueue.pop_front();
 +        }
 +
@@ -2252,6 +2358,32 @@ index 0000000000..4b59216290
 +        while (!activeStoreList.empty() && activeStoreList.front().seqNum <= seqNum) {
 +            activeStoreList.pop_front();
 +        }
++    }
++
++    RSFIFOMatch
++    findForwardingStore(Addr loadPhysAddr, uint8_t loadSize, InstSeqNum loadSeqNum)
++    {
++        RSFIFOMatch match;
++        if (loadSize == 0) {
++            return match;
++        }
++        for (int i = (int)committedStoreQueue.size() - 1; i >= 0; i--) {
++            const auto &entry = committedStoreQueue[i];
++            if (entry.seqNum >= loadSeqNum) {
++                continue;
++            }
++            if (entry.size != loadSize) {
++                continue;
++            }
++            if (entry.physAddr != loadPhysAddr) {
++                continue;
++            }
++            match.found = true;
++            match.storePC = entry.pc;
++            match.storeSeqNum = entry.seqNum;
++            return match;
++        }
++        return match;
 +    }
 +
 +    void
@@ -2490,10 +2622,10 @@ index 0000000000..4b59216290
 +#endif // __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 diff --git a/src/cpu/valuepred/memory_renaming_pipeline_harness.hh b/src/cpu/valuepred/memory_renaming_pipeline_harness.hh
 new file mode 100644
-index 0000000000..2c6aa880f5
+index 0000000000..e9cd55e5de
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_pipeline_harness.hh
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,333 @@
 +#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_PIPELINE_HARNESS_HH__
 +#define __CPU_VALUEPRED_MEMORY_RENAMING_PIPELINE_HARNESS_HH__
 +
@@ -2537,6 +2669,7 @@ index 0000000000..2c6aa880f5
 +        1,      // reallocationConfidence
 +        1,      // demotionPenalty
 +        8,      // mrtQueueCapacity
++        512,    // committedStoreQueueCapacity
 +        true,   // enableDynamic
 +        true,   // enableStatic
 +        1       // numThreads
@@ -2735,9 +2868,9 @@ index 0000000000..2c6aa880f5
 +
 +    explicit CommitPipelineHarness(MemoryRenamingCore<int> &c) : core(c) {}
 +
-+    void commitStore(Addr pc, InstSeqNum seqNum)
++    void commitStore(Addr pc, InstSeqNum seqNum, Addr physAddr = 0, uint8_t size = 0)
 +    {
-+        core.commitStore(pc, seqNum);
++        core.commitStore(pc, seqNum, physAddr, size);
 +    }
 +
 +    /**
@@ -2750,7 +2883,9 @@ index 0000000000..2c6aa880f5
 +                                InstSeqNum storeSeqNum,
 +                                bool vpSpeculative, bool vpMisprediction,
 +                                uint64_t predictedVal = 0,
-+                                uint64_t actualVal = 0)
++                                uint64_t actualVal = 0,
++                                Addr loadPhysAddr = 0,
++                                uint8_t loadSize = 0)
 +    {
 +        LoadCommitResult result;
 +
@@ -2764,8 +2899,21 @@ index 0000000000..2c6aa880f5
 +                result.demoted = true;
 +            }
 +        } else {
-+            core.trainMRP(loadPC, 0, 0, false);
-+            result.demoted = true;
++            auto match = core.findForwardingStore(loadPhysAddr, loadSize, loadSeqNum);
++            if (match.found) {
++                result.producerOffset =
++                    core.getProducerOffset(match.storeSeqNum, match.storePC);
++                if (result.producerOffset >= 0) {
++                    core.trainMRP(loadPC, match.storePC, result.producerOffset, true);
++                    result.trained = true;
++                } else {
++                    core.trainMRP(loadPC, 0, 0, false);
++                    result.demoted = true;
++                }
++            } else {
++                core.trainMRP(loadPC, 0, 0, false);
++                result.demoted = true;
++            }
 +        }
 +
 +        core.retireSRP(tid, loadSeqNum);
@@ -2988,10 +3136,10 @@ index 0000000000..40e43c9344
 +}
 diff --git a/src/cpu/valuepred/valuepred_metadata.hh b/src/cpu/valuepred/valuepred_metadata.hh
 new file mode 100644
-index 0000000000..a81aa97a24
+index 0000000000..1c80f8cf9a
 --- /dev/null
 +++ b/src/cpu/valuepred/valuepred_metadata.hh
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,207 @@
 +#ifndef __VALUEPRED_METADATA_HH_
 +#define __VALUEPRED_METADATA_HH_
 +
@@ -3111,6 +3259,8 @@ index 0000000000..a81aa97a24
 +    ThreadID tid = 0;
 +    RegVal actualValue = 0;
 +    bool isMisprediction = false;
++    Addr physAddr = 0;
++    uint8_t accessSize = 0;
 +
 +    template <typename Ext, typename... Args>
 +    Ext &
