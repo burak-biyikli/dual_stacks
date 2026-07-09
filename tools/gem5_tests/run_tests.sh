@@ -21,8 +21,11 @@ BUILD_LOG="/tmp/gem5_build.log"
 
 echo -e "\n=== Rebuilding gem5 and unit tests==="
 
-# Define both targets
-TARGETS="build/X86/cpu/valuepred/memory_renaming.test.opt build/X86/gem5.opt"
+# Define all unit test and simulator targets
+TARGETS="build/X86/cpu/valuepred/memory_renaming.test.opt \
+         build/X86/cpu/valuepred/memory_renaming_rename_pipeline.test.opt \
+         build/X86/cpu/valuepred/memory_renaming_commit_pipeline.test.opt \
+         build/X86/gem5.opt"
 
 # Build all targets quietly unless verbose
 if [ "$VERBOSE" -eq 1 ]; then
@@ -39,8 +42,16 @@ fi
 
 echo -e "\n=== Running gem5 Value Predictor Unit Tests ==="
 
-# Let the gtest output print directly to the screen
-./build/X86/cpu/valuepred/memory_renaming.test.opt
+UNIT_TESTS=(
+    "build/X86/cpu/valuepred/memory_renaming.test.opt"
+    "build/X86/cpu/valuepred/memory_renaming_rename_pipeline.test.opt"
+    "build/X86/cpu/valuepred/memory_renaming_commit_pipeline.test.opt"
+)
+
+for test_bin in "${UNIT_TESTS[@]}"; do
+    echo "--> $(basename "$test_bin")"
+    ./"$test_bin"
+done
 
 echo -e "\n=== Running gem5 Microbenchmarks ==="
 cd "$SCRIPT_DIR"

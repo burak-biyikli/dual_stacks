@@ -617,10 +617,10 @@ index 9810286c05..1d2713e0f3 100644
  
 diff --git a/src/cpu/valuepred/SConscript b/src/cpu/valuepred/SConscript
 new file mode 100644
-index 0000000000..2045a38f08
+index 0000000000..25aa51554c
 --- /dev/null
 +++ b/src/cpu/valuepred/SConscript
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,20 @@
 +Import('*')
 +
 +SimObject('ValuePredictor.py',
@@ -636,13 +636,17 @@ index 0000000000..2045a38f08
 +DebugFlag('MemoryRenaming')
 +
 +GTest('memory_renaming.test', 'memory_renaming.test.cc')
++GTest('memory_renaming_rename_pipeline.test',
++      'memory_renaming_rename_pipeline.test.cc')
++GTest('memory_renaming_commit_pipeline.test',
++      'memory_renaming_commit_pipeline.test.cc')
 +
 diff --git a/src/cpu/valuepred/ValuePredictor.py b/src/cpu/valuepred/ValuePredictor.py
 new file mode 100644
-index 0000000000..93a8591ada
+index 0000000000..4c12d5fbac
 --- /dev/null
 +++ b/src/cpu/valuepred/ValuePredictor.py
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,34 @@
 +from m5.params import *
 +from m5.proxy import *
 +from m5.SimObject import *
@@ -669,6 +673,8 @@ index 0000000000..93a8591ada
 +    logESTBEntrys = Param.Int(10, "log 2 of store-load cache / MRP sets (10 -> 1024 sets)")
 +    logMaxConfidence = Param.Int(2, "log 2 of max confidence number (2 -> 0..3)")
 +    predictionThreshold = Param.Int(3, "threshold of confidence to enable prediction")
++    allocationConfidence = Param.Int(1, "starting confidence when a new MRP entry is allocated")
++    reallocationConfidence = Param.Int(1, "starting confidence when a load changes its producer store PC")
 +    demotionPenalty = Param.Int(1, "Demotion penalty for wrong prediction or missing store")
 +    mrtQueueCapacity = Param.Int(8, "Capacity of each circular queue in the MRT")
 +
@@ -677,10 +683,10 @@ index 0000000000..93a8591ada
 +    enableStatic = Param.Bool(True, "Enable static Memory Renaming path (SRP)")
 diff --git a/src/cpu/valuepred/memory_renaming.cc b/src/cpu/valuepred/memory_renaming.cc
 new file mode 100644
-index 0000000000..0115fd93e1
+index 0000000000..a868094bc3
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.cc
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,259 @@
 +#include "cpu/valuepred/memory_renaming.hh"
 +
 +#include <algorithm>
@@ -701,7 +707,9 @@ index 0000000000..0115fd93e1
 +    : VPUnit(params),
 +      core(params.ways, 1 << params.logESTBEntrys, params.tagWidth, params.logESTBEntrys,
 +           params.logMaxConfidence, params.predictionThreshold,
-+           params.demotionPenalty, params.mrtQueueCapacity, params.enableDynamic, params.enableStatic, params.numThreads)
++           params.allocationConfidence, params.reallocationConfidence,
++           params.demotionPenalty, params.mrtQueueCapacity, params.enableDynamic,
++           params.enableStatic, params.numThreads)
 +{
 +    uint64_t maxThreshold = (1ULL << params.logMaxConfidence) - 1;
 +    fatal_if(params.predictionThreshold > maxThreshold,
@@ -710,6 +718,14 @@ index 0000000000..0115fd93e1
 +    fatal_if(params.predictionThreshold < 0,
 +             "MemoryRenaming: predictionThreshold (%d) cannot be negative.", 
 +             params.predictionThreshold);
++    fatal_if(params.allocationConfidence < 0 ||
++             params.allocationConfidence > maxThreshold,
++             "MemoryRenaming: allocationConfidence (%d) must be in [0, %d].",
++             params.allocationConfidence, maxThreshold);
++    fatal_if(params.reallocationConfidence < 0 ||
++             params.reallocationConfidence > maxThreshold,
++             "MemoryRenaming: reallocationConfidence (%d) must be in [0, %d].",
++             params.reallocationConfidence, maxThreshold);
 +}
 +
 +VPPredictionCandidate
@@ -843,7 +859,7 @@ index 0000000000..0115fd93e1
 +        Addr storePC = producerInfo->producerStorePC;
 +        InstSeqNum storeSeqNum = producerInfo->producerStoreSeqNum;
 +
-+        int offset = core.getProducerOffset(storeSeqNum);
++        int offset = core.getProducerOffset(storeSeqNum, storePC);
 +
 +        if (offset >= 0) {
 +            core.trainMRP(loadPC, storePC, offset, true);
@@ -1013,10 +1029,10 @@ index 0000000000..9664cb134f
 +#endif // __CPU_VALUEPRED_MEMORY_RENAMING_HH__
 diff --git a/src/cpu/valuepred/memory_renaming.test.cc b/src/cpu/valuepred/memory_renaming.test.cc
 new file mode 100644
-index 0000000000..4da89cd6e0
+index 0000000000..4104e926b0
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.test.cc
-@@ -0,0 +1,894 @@
+@@ -0,0 +1,669 @@
 +#include <gtest/gtest.h>
 +#include <random>
 +#include <vector>
@@ -1039,6 +1055,8 @@ index 0000000000..4da89cd6e0
 +            10,     // logESTBEntrys
 +            2,      // logMaxConfidence (max=3)
 +            2,      // confidenceThreshold
++            1,      // allocationConfidence
++            1,      // reallocationConfidence
 +            1,      // demotionPenalty
 +            8,      // mrtQueueCapacity
 +            true,   // enableDynamic
@@ -1124,6 +1142,42 @@ index 0000000000..4da89cd6e0
 +    delete core;
 +}
 +
++TEST_F(MemoryRenamingCoreTest, MRPReallocationConfidenceFreezesOnPCChange)
++{
++    auto core = new MemoryRenamingCore<int>(
++        4, 1024, 16, 10, 2, 2, 1, 0, 1, 8, true, true, 1);
++
++    Addr loadPC = 0x1000;
++    Addr storePC1 = 0x2000;
++    Addr storePC2 = 0x3000;
++    int offset = 0;
++
++    core->trainMRP(loadPC, storePC1, offset, true);
++    core->trainMRP(loadPC, storePC1, offset, true);
++    core->trainMRP(loadPC, storePC2, offset, true);
++
++    int way = -1;
++    for (int i = 0; i < core->ways; i++) {
++        uint32_t idx = core->pcHashToWayIndex(loadPC, i);
++        uint32_t tag = core->pcHashToTag(loadPC, i);
++        auto &entry = core->mrpTable[i][idx];
++        if (entry.valid && core->compareTags(entry.tag, tag) == 0) {
++            way = i;
++            EXPECT_EQ(entry.storePC, storePC2);
++            EXPECT_EQ(entry.confidence, 0);
++            EXPECT_TRUE(entry.frozen);
++            break;
++        }
++    }
++    EXPECT_NE(way, -1);
++
++    bool outFrozen = false;
++    EXPECT_TRUE(core->lookupMRP(loadPC, outFrozen));
++    EXPECT_TRUE(outFrozen);
++
++    delete core;
++}
++
 +TEST_F(MemoryRenamingCoreTest, MRPConfidenceTuneableDemotionAndClamping)
 +{
 +    // Create core with demotionPenalty = 3, threshold = 1, max confidence = 7 (logMaxConfidence = 3)
@@ -1134,6 +1188,8 @@ index 0000000000..4da89cd6e0
 +        10,     // logESTBEntrys
 +        3,      // logMaxConfidence (max = 7)
 +        1,      // confidenceThreshold
++        1,      // allocationConfidence
++        1,      // reallocationConfidence
 +        3,      // demotionPenalty
 +        8,      // mrtQueueCapacity
 +        true,   // enableDynamic
@@ -1204,6 +1260,8 @@ index 0000000000..4da89cd6e0
 +        0,      // logESTBEntrys
 +        2,      // logMaxConfidence
 +        2,      // confidenceThreshold
++        1,      // allocationConfidence
++        1,      // reallocationConfidence
 +        1,      // demotionPenalty
 +        8,      // mrtQueueCapacity
 +        true,   // enableDynamic
@@ -1291,6 +1349,8 @@ index 0000000000..4da89cd6e0
 +        0,      // logESTBEntrys
 +        2,      // logMaxConfidence
 +        2,      // confidenceThreshold
++        1,      // allocationConfidence
++        1,      // reallocationConfidence
 +        1,      // demotionPenalty
 +        8,      // mrtQueueCapacity
 +        true,   // enableDynamic
@@ -1553,15 +1613,16 @@ index 0000000000..4da89cd6e0
 +TEST_F(MemoryRenamingCoreTest, CommitProducerOffset)
 +{
 +    auto core = createDefaultCore();
++    Addr storePC = 0x1000;
 +
-+    core->commitStore(0x1000, 10);
++    core->commitStore(storePC, 10);
 +    core->commitStore(0x1100, 12);
-+    core->commitStore(0x1200, 15);
++    core->commitStore(storePC, 15);
 +
-+    EXPECT_EQ(core->getProducerOffset(15), 0);
-+    EXPECT_EQ(core->getProducerOffset(12), 1);
-+    EXPECT_EQ(core->getProducerOffset(10), 2);
-+    EXPECT_EQ(core->getProducerOffset(99), -1);
++    EXPECT_EQ(core->getProducerOffset(15, storePC), 0);
++    EXPECT_EQ(core->getProducerOffset(12, 0x1100), 0);
++    EXPECT_EQ(core->getProducerOffset(10, storePC), 1);
++    EXPECT_EQ(core->getProducerOffset(99, storePC), -1);
 +
 +    delete core;
 +}
@@ -1641,282 +1702,211 @@ index 0000000000..4da89cd6e0
 +    delete core;
 +}
 +
-+// ============================================================================
-+// 6. Rename-Stage Pipeline Harness (mocked rename unit integration)
-+// ============================================================================
+diff --git a/src/cpu/valuepred/memory_renaming_commit_pipeline.test.cc b/src/cpu/valuepred/memory_renaming_commit_pipeline.test.cc
+new file mode 100644
+index 0000000000..ca5c670967
+--- /dev/null
++++ b/src/cpu/valuepred/memory_renaming_commit_pipeline.test.cc
+@@ -0,0 +1,193 @@
++#include <gtest/gtest.h>
 +
-+/**
-+ * Simulates the MemoryRenaming rename-stage contract using integer physical
-+ * register indices instead of gem5 DynInst / SimObject dependencies. This
-+ * exercises MRP+SRP+MRT together with the pending-load queue, writeback hook,
-+ * LSU completion cleanup, and squash rollback — the same stimulus/response
-+ * pattern Rename applies to MemoryRenaming in the O3 pipeline.
-+ */
-+class RenamePipelineHarness
++#include "cpu/valuepred/memory_renaming_pipeline_harness.hh"
++
++using namespace gem5;
++using namespace gem5::valuepred;
++using namespace gem5::valuepred::test;
++
++class CommitPipelineTest : public ::testing::Test
 +{
-+  public:
-+    MemoryRenamingCore<int> core;
-+    ThreadID tid = 0;
++  protected:
++    MemoryRenamingCore<int> *core = nullptr;
++    CommitPipelineHarness *commit = nullptr;
 +
-+    std::unordered_map<int, uint64_t> physRegs;
-+    std::unordered_map<int, bool> scoreboard;
-+
-+    struct PendingLoad
++    void SetUp() override
 +    {
-+        InstSeqNum loadSeq = 0;
-+        int ldPhysReg = -1;
-+        uint64_t predictedVal = 0;
-+        bool speculative = false;
-+    };
-+    std::unordered_map<int, std::vector<PendingLoad>> pendingLoads;
-+
-+    explicit RenamePipelineHarness(MemoryRenamingCore<int> *c) : core(*c) {}
-+
-+    void setRegReady(int physReg, uint64_t val)
-+    {
-+        physRegs[physReg] = val;
-+        scoreboard[physReg] = true;
++        core = createDefaultCore();
++        commit = new CommitPipelineHarness(*core);
 +    }
 +
-+    void renameStore(Addr storePC, InstSeqNum seqNum, int stPhysReg,
-+                     bool srcReady, uint64_t srcVal, uint8_t size = 8,
-+                     bool trackSRP = false, int64_t spOffset = 0)
++    void TearDown() override
 +    {
-+        core.insertStore(storePC, seqNum, tid, size, stPhysReg, srcReady, srcVal);
-+        if (trackSRP) {
-+            core.pushSRP(tid, storePC, seqNum, size, spOffset, stPhysReg);
-+        }
++        delete commit;
++        commit = nullptr;
++        delete core;
++        core = nullptr;
 +    }
 +
-+    bool renameLoad(Addr loadPC, InstSeqNum seqNum, int ldPhysReg,
-+                    uint8_t size = 8, bool isPop = false, bool isPeek = false,
-+                    int64_t disp = 0)
++    int mrpConfidence(Addr loadPC)
 +    {
-+        bool speculative = false, ready = false;
-+        Addr data = 0;
-+        int stReg = 0;
-+        bool hit = core.matchLoad(loadPC, size, tid, seqNum, isPop, isPeek, disp,
-+                                  speculative, data, stReg, ready);
-+        if (!hit) {
-+            return false;
++        for (int w = 0; w < core->ways; w++) {
++            uint32_t idx = core->pcHashToWayIndex(loadPC, w);
++            uint32_t tag = core->pcHashToTag(loadPC, w);
++            auto &entry = core->mrpTable[w][idx];
++            if (entry.valid && core->compareTags(entry.tag, tag) == 0) {
++                return entry.confidence;
++            }
 +        }
-+        if (ready) {
-+            physRegs[ldPhysReg] = data;
-+            scoreboard[ldPhysReg] = true;
-+        } else {
-+            PendingLoad pending;
-+            pending.loadSeq = seqNum;
-+            pending.ldPhysReg = ldPhysReg;
-+            pending.speculative = true;
-+            pendingLoads[stReg].push_back(pending);
-+        }
-+        return true;
-+    }
-+
-+    void writebackReg(int stPhysReg, uint64_t val)
-+    {
-+        core.updateMRTData(stPhysReg, val);
-+        auto it = pendingLoads.find(stPhysReg);
-+        if (it == pendingLoads.end()) {
-+            return;
-+        }
-+        for (auto &load : it->second) {
-+            load.predictedVal = val;
-+            load.speculative = true;
-+            physRegs[load.ldPhysReg] = val;
-+            scoreboard[load.ldPhysReg] = true;
-+        }
-+        pendingLoads.erase(it);
-+    }
-+
-+    void completeLoadLSU(InstSeqNum loadSeq)
-+    {
-+        for (auto &pair : pendingLoads) {
-+            auto &list = pair.second;
-+            list.erase(
-+                std::remove_if(list.begin(), list.end(),
-+                               [loadSeq](const PendingLoad &l) {
-+                                   return l.loadSeq == loadSeq;
-+                               }),
-+                list.end());
-+        }
-+    }
-+
-+    void squash(InstSeqNum squashSn)
-+    {
-+        core.squash(tid, squashSn);
-+        for (auto &pair : pendingLoads) {
-+            auto &list = pair.second;
-+            list.erase(
-+                std::remove_if(list.begin(), list.end(),
-+                               [squashSn](const PendingLoad &l) {
-+                                   return l.loadSeq > squashSn;
-+                               }),
-+                list.end());
-+        }
-+    }
-+
-+    void commitLoad(Addr loadPC, Addr storePC, InstSeqNum storeSeqNum,
-+                    InstSeqNum loadSeqNum)
-+    {
-+        int offset = core.getProducerOffset(storeSeqNum);
-+        if (offset >= 0) {
-+            core.trainMRP(loadPC, storePC, offset, true);
-+        } else {
-+            core.trainMRP(loadPC, 0, 0, false);
-+        }
-+        core.retireSRP(tid, loadSeqNum);
-+    }
-+
-+    size_t pendingCount() const
-+    {
-+        size_t total = 0;
-+        for (const auto &pair : pendingLoads) {
-+            total += pair.second.size();
-+        }
-+        return total;
++        return -1;
 +    }
 +};
 +
-+TEST_F(MemoryRenamingCoreTest, RenameHarnessCaseAImmediateInjection)
++TEST_F(CommitPipelineTest, StoreCommitEnablesProducerOffset)
 +{
-+    auto core = createDefaultCore();
-+    RenamePipelineHarness harness(core);
++    Addr storePC = 0x1000;
++
++    commit->commitStore(storePC, 10);
++    commit->commitStore(0x1100, 12);
++    commit->commitStore(storePC, 15);
++
++    EXPECT_EQ(core->getProducerOffset(15, storePC), 0);
++    EXPECT_EQ(core->getProducerOffset(12, 0x1100), 0);
++    EXPECT_EQ(core->getProducerOffset(10, storePC), 1);
++}
++
++TEST_F(CommitPipelineTest, LoadTrainingWithForwarding)
++{
++    Addr loadPC = 0x3000;
++    Addr storePC = 0x2000;
++
++    commit->commitStore(storePC, 10);
++    auto result = commit->commitLoad(loadPC, 12, true, storePC, 10,
++                                     true, false);
++    EXPECT_TRUE(result.trained);
++    EXPECT_EQ(result.producerOffset, 0);
++    EXPECT_EQ(mrpConfidence(loadPC), 1);
++
++    commit->commitStore(storePC, 20);
++    result = commit->commitLoad(loadPC, 22, true, storePC, 20, true, false);
++    EXPECT_EQ(mrpConfidence(loadPC), 2);
++}
++
++TEST_F(CommitPipelineTest, LoadTrainingNoForwardingDemotes)
++{
++    Addr loadPC = 0x3000;
++    Addr storePC = 0x2000;
++
++    commit->commitStore(storePC, 10);
++    commit->commitLoad(loadPC, 12, true, storePC, 10, true, false);
++    EXPECT_EQ(mrpConfidence(loadPC), 1);
++
++    auto result = commit->commitLoad(loadPC, 14, false, 0, 0, true, false);
++    EXPECT_TRUE(result.demoted);
++    EXPECT_EQ(mrpConfidence(loadPC), 0);
++}
++
++TEST_F(CommitPipelineTest, LoadTrainingUnknownProducerDemotes)
++{
++    Addr loadPC = 0x3000;
++
++    commit->commitStore(0x2000, 10);
++    auto result = commit->commitLoad(loadPC, 12, true, 0x9999, 99,
++                                     true, false);
++    EXPECT_TRUE(result.demoted);
++    EXPECT_EQ(result.producerOffset, -1);
++}
++
++TEST_F(CommitPipelineTest, StorePCMismatchResetsConfidence)
++{
++    Addr loadPC = 0x3000;
++
++    commit->commitStore(0x2000, 10);
++    commit->commitLoad(loadPC, 12, true, 0x2000, 10, true, false);
++    commit->commitStore(0x2000, 20);
++    commit->commitLoad(loadPC, 22, true, 0x2000, 20, true, false);
++    EXPECT_EQ(mrpConfidence(loadPC), 2);
++
++    commit->commitStore(0x3000, 30);
++    commit->commitLoad(loadPC, 32, true, 0x3000, 30, true, false);
++    EXPECT_EQ(mrpConfidence(loadPC), 1);
++}
++
++TEST_F(CommitPipelineTest, SRPRetireOnLoadCommit)
++{
++    core->pushSRP(0, 0x1000, 10, 8, -8, 5);
++    core->srpStacks[0].back().popped = true;
++    core->srpStacks[0].back().poppedSeqNum = 15;
++
++    EXPECT_EQ(core->srpStacks[0].size(), 1u);
++    commit->commitLoad(0x2000, 15, false, 0, 0, false, false);
++    EXPECT_EQ(core->srpStacks[0].size(), 0u);
++}
++
++TEST_F(CommitPipelineTest, VPcorrectIncrementsOnSuccessfulPrediction)
++{
++    commit->commitStore(0x2000, 10);
++    commit->commitLoad(0x3000, 12, true, 0x2000, 10, true, false);
++    EXPECT_EQ(commit->vpCorrect, 1u);
++
++    commit->commitLoad(0x3000, 14, false, 0, 0, true, true);
++    EXPECT_EQ(commit->vpCorrect, 1u);
++}
++
++TEST_F(CommitPipelineTest, MispredictionSquashDeferredUntilBoundary)
++{
++    auto result = commit->commitLoad(0x3000, 12, false, 0, 0,
++                                     true, true);
++    EXPECT_TRUE(result.squashPending);
++    EXPECT_TRUE(commit->isSquashPending());
++    EXPECT_EQ(commit->getLastSquashAfterSn(), 0u);
++
++    EXPECT_TRUE(commit->finishInstBoundary());
++    EXPECT_FALSE(commit->isSquashPending());
++    EXPECT_EQ(commit->getLastSquashAfterSn(), 12u);
++}
++
++TEST_F(CommitPipelineTest, MispredictionSquashAtBoundary)
++{
++    commit->commitLoad(0x3000, 12, false, 0, 0, true, true);
++    EXPECT_TRUE(commit->finishInstBoundary());
++    EXPECT_EQ(commit->getLastSquashAfterSn(), 12u);
++}
++
++TEST_F(CommitPipelineTest, MultiStoreOffsetTraining)
++{
++    Addr loadPC = 0x3000;
++    Addr storePC = 0x2000;
++
++    for (int i = 0; i < 3; i++) {
++        commit->commitStore(storePC, 100 + i);
++    }
++
++    auto result = commit->commitLoad(loadPC, 200, true, storePC, 100,
++                                     true, false);
++    EXPECT_EQ(result.producerOffset, 2);
++    EXPECT_TRUE(result.trained);
++    EXPECT_EQ(mrpConfidence(loadPC), 1);
++}
++
++TEST_F(CommitPipelineTest, RenameCommitEndToEndMRPThreshold)
++{
++    RenamePipelineHarness rename(core);
 +
 +    Addr storePC = 0x1000;
 +    Addr loadPC = 0x1500;
 +
-+    harness.renameStore(storePC, 10, 5, true, 0xCAFE);
-+    harness.core.trainMRP(loadPC, storePC, 0, true);
-+    harness.core.trainMRP(loadPC, storePC, 0, true);
++    for (int iter = 0; iter < 3; iter++) {
++        InstSeqNum storeSn = 10 + iter * 10;
++        InstSeqNum loadSn = 12 + iter * 10;
 +
-+    EXPECT_TRUE(harness.renameLoad(loadPC, 12, 8));
-+    EXPECT_TRUE(harness.scoreboard[8]);
-+    EXPECT_EQ(harness.physRegs[8], 0xCAFE);
++        rename.renameStore(storePC, storeSn, 5, true, 0x100 + iter);
++        rename.core.trainMRP(loadPC, storePC, 0, true);
++        rename.core.trainMRP(loadPC, storePC, 0, true);
++        EXPECT_TRUE(rename.renameLoad(loadPC, loadSn, 8));
 +
-+    harness.commitLoad(loadPC, storePC, 10, 12);
-+    delete core;
++        commit->commitStore(storePC, storeSn);
++        commit->commitLoad(loadPC, loadSn, true, storePC, storeSn,
++                           true, false);
++    }
++
++    EXPECT_GE(mrpConfidence(loadPC), 2);
++    EXPECT_EQ(commit->vpCorrect, 3u);
 +}
-+
-+TEST_F(MemoryRenamingCoreTest, RenameHarnessCaseBPendingWriteback)
-+{
-+    auto core = createDefaultCore();
-+    RenamePipelineHarness harness(core);
-+
-+    Addr storePC = 0x1000;
-+    Addr loadPC = 0x1500;
-+
-+    // Store source register not ready at rename
-+    harness.renameStore(storePC, 10, 5, false, 0);
-+    harness.core.trainMRP(loadPC, storePC, 0, true);
-+    harness.core.trainMRP(loadPC, storePC, 0, true);
-+
-+    EXPECT_TRUE(harness.renameLoad(loadPC, 12, 8));
-+    EXPECT_FALSE(harness.scoreboard[8]);
-+    EXPECT_EQ(harness.pendingCount(), 1u);
-+
-+    harness.writebackReg(5, 0x12345678);
-+    EXPECT_EQ(harness.pendingCount(), 0u);
-+    EXPECT_TRUE(harness.scoreboard[8]);
-+    EXPECT_EQ(harness.physRegs[8], 0x12345678);
-+
-+    delete core;
-+}
-+
-+TEST_F(MemoryRenamingCoreTest, RenameHarnessMultiplePendingLoads)
-+{
-+    auto core = createDefaultCore();
-+    RenamePipelineHarness harness(core);
-+
-+    Addr storePC = 0x1000;
-+    Addr loadPC1 = 0x1500;
-+    Addr loadPC2 = 0x1600;
-+
-+    harness.renameStore(storePC, 10, 5, false, 0);
-+    harness.core.trainMRP(loadPC1, storePC, 0, true);
-+    harness.core.trainMRP(loadPC1, storePC, 0, true);
-+    harness.core.trainMRP(loadPC2, storePC, 0, true);
-+    harness.core.trainMRP(loadPC2, storePC, 0, true);
-+
-+    EXPECT_TRUE(harness.renameLoad(loadPC1, 12, 8));
-+    EXPECT_TRUE(harness.renameLoad(loadPC2, 13, 9));
-+    EXPECT_EQ(harness.pendingCount(), 2u);
-+
-+    harness.writebackReg(5, 0xABCDEF00);
-+    EXPECT_EQ(harness.pendingCount(), 0u);
-+    EXPECT_EQ(harness.physRegs[8], 0xABCDEF00);
-+    EXPECT_EQ(harness.physRegs[9], 0xABCDEF00);
-+
-+    delete core;
-+}
-+
-+TEST_F(MemoryRenamingCoreTest, RenameHarnessLSUCompletionRace)
-+{
-+    auto core = createDefaultCore();
-+    RenamePipelineHarness harness(core);
-+
-+    Addr storePC = 0x1000;
-+    Addr loadPC = 0x1500;
-+
-+    harness.renameStore(storePC, 10, 5, false, 0);
-+    harness.core.trainMRP(loadPC, storePC, 0, true);
-+    harness.core.trainMRP(loadPC, storePC, 0, true);
-+    EXPECT_TRUE(harness.renameLoad(loadPC, 12, 8));
-+    EXPECT_EQ(harness.pendingCount(), 1u);
-+
-+    // LSU completes first with the correct value
-+    harness.physRegs[8] = 0x99998888;
-+    harness.scoreboard[8] = true;
-+    harness.completeLoadLSU(12);
-+    EXPECT_EQ(harness.pendingCount(), 0u);
-+
-+    // Late store writeback must not corrupt the LSU result
-+    harness.writebackReg(5, 0x11112222);
-+    EXPECT_EQ(harness.physRegs[8], 0x99998888);
-+
-+    delete core;
-+}
-+
-+TEST_F(MemoryRenamingCoreTest, RenameHarnessSquashCleansPendingAndTables)
-+{
-+    auto core = createDefaultCore();
-+    RenamePipelineHarness harness(core);
-+
-+    harness.renameStore(0x1000, 10, 5, false, 0, 8, true, -8);
-+    harness.renameStore(0x1100, 15, 6, false, 0, 8, true, -16);
-+    harness.core.trainMRP(0x2000, 0x1100, 0, true);
-+    harness.core.trainMRP(0x2000, 0x1100, 0, true);
-+    EXPECT_TRUE(harness.renameLoad(0x2000, 18, 8, 8, true));
-+
-+    EXPECT_EQ(harness.pendingCount(), 1u);
-+    EXPECT_EQ(harness.core.srpStacks[0].size(), 2u);
-+
-+    harness.squash(13);
-+    EXPECT_EQ(harness.pendingCount(), 0u);
-+    EXPECT_EQ(harness.core.srpStacks[0].size(), 1u);
-+    EXPECT_EQ(harness.core.mrtTable[0x1100].count, 0);
-+
-+    delete core;
-+}
-+
-+TEST_F(MemoryRenamingCoreTest, RenameHarnessSRPStaticPath)
-+{
-+    auto core = createDefaultCore();
-+    RenamePipelineHarness harness(core);
-+
-+    harness.renameStore(0x1000, 10, 5, true, 0x42, 8, true, -8);
-+    EXPECT_TRUE(harness.renameLoad(0x2000, 15, 8, 8, true));
-+    EXPECT_EQ(harness.physRegs[8], 0x42);
-+
-+    delete core;
-+}
-+
 diff --git a/src/cpu/valuepred/memory_renaming_core.hh b/src/cpu/valuepred/memory_renaming_core.hh
 new file mode 100644
-index 0000000000..b87ed230fa
+index 0000000000..4b59216290
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_core.hh
-@@ -0,0 +1,566 @@
+@@ -0,0 +1,581 @@
 +#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 +#define __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 +
@@ -2077,6 +2067,8 @@ index 0000000000..b87ed230fa
 +    const int logMaxConfidence;
 +    const int MAXCONFIDENCE;
 +    const int confidenceThreshold;
++    const int allocationConfidence;
++    const int reallocationConfidence;
 +    const int demotionPenalty;
 +    const int mrtQueueCapacity;
 +    const bool enableDynamic;
@@ -2090,11 +2082,16 @@ index 0000000000..b87ed230fa
 +    std::deque<CommittedStore> committedStoreQueue;
 +
 +    MemoryRenamingCore(int _ways, int _entryCounts, int _tagWidth, int _logESTBEntrys,
-+                       int _logMaxConfidence, int _confidenceThreshold, int _demotionPenalty,
-+                       int _mrtQueueCapacity, bool _enableDynamic, bool _enableStatic, int numThreads)
++                       int _logMaxConfidence, int _confidenceThreshold,
++                       int _allocationConfidence, int _reallocationConfidence,
++                       int _demotionPenalty, int _mrtQueueCapacity, bool _enableDynamic,
++                       bool _enableStatic, int numThreads)
 +        : ways(_ways), entryCounts(_entryCounts), tagWidth(_tagWidth), logESTBEntrys(_logESTBEntrys),
 +          logMaxConfidence(_logMaxConfidence), MAXCONFIDENCE((1 << _logMaxConfidence) - 1),
-+          confidenceThreshold(_confidenceThreshold), demotionPenalty(_demotionPenalty),
++          confidenceThreshold(_confidenceThreshold),
++          allocationConfidence(_allocationConfidence),
++          reallocationConfidence(_reallocationConfidence),
++          demotionPenalty(_demotionPenalty),
 +          mrtQueueCapacity(_mrtQueueCapacity), enableDynamic(_enableDynamic), enableStatic(_enableStatic)
 +    {
 +        mrpTable.resize(ways);
@@ -2189,11 +2186,15 @@ index 0000000000..b87ed230fa
 +                        }
 +                    }
 +                } else {
-+                    // Mismatch resets entry and unfreezes
 +                    mrpEntry.storePC = storePC;
 +                    mrpEntry.offset = offset;
-+                    mrpEntry.confidence = 1;
-+                    mrpEntry.frozen = false;
++                    mrpEntry.confidence = reallocationConfidence;
++                    if (reallocationConfidence == allocationConfidence) {
++                        mrpEntry.frozen = false;
++                    } else {
++                        mrpEntry.frozen =
++                            reallocationConfidence < confidenceThreshold;
++                    }
 +                }
 +            } else {
 +                if (!mrpEntry.frozen) {
@@ -2231,7 +2232,7 @@ index 0000000000..b87ed230fa
 +            victim.tag = tagEachWays[victimWay];
 +            victim.storePC = storePC;
 +            victim.offset = offset;
-+            victim.confidence = 1; // Start confidence above 0
++            victim.confidence = allocationConfidence;
 +            victim.rrip = 2; // Allocation RRIP
 +        }
 +    }
@@ -2268,11 +2269,15 @@ index 0000000000..b87ed230fa
 +    }
 +
 +    int
-+    getProducerOffset(InstSeqNum producerStoreSeqNum)
++    getProducerOffset(InstSeqNum producerStoreSeqNum, Addr storePC)
 +    {
++        int offset = 0;
 +        for (int i = (int)committedStoreQueue.size() - 1; i >= 0; i--) {
 +            if (committedStoreQueue[i].seqNum == producerStoreSeqNum) {
-+                return (int)committedStoreQueue.size() - 1 - i;
++                return offset;
++            }
++            if (committedStoreQueue[i].pc == storePC) {
++                offset++;
 +            }
 +        }
 +        return -1;
@@ -2483,6 +2488,504 @@ index 0000000000..b87ed230fa
 +} // namespace gem5
 +
 +#endif // __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
+diff --git a/src/cpu/valuepred/memory_renaming_pipeline_harness.hh b/src/cpu/valuepred/memory_renaming_pipeline_harness.hh
+new file mode 100644
+index 0000000000..2c6aa880f5
+--- /dev/null
++++ b/src/cpu/valuepred/memory_renaming_pipeline_harness.hh
+@@ -0,0 +1,317 @@
++#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_PIPELINE_HARNESS_HH__
++#define __CPU_VALUEPRED_MEMORY_RENAMING_PIPELINE_HARNESS_HH__
++
++/**
++ * Lightweight pipeline harnesses for Memory Renaming unit/integration tests.
++ *
++ * These classes mirror the rename- and commit-stage contracts implemented in
++ * memory_renaming.cc and commit.cc without requiring SimObject, DynInst, or
++ * CPU initialization. When the production hooks change, update the harness
++ * methods here once rather than duplicating logic across test files.
++ */
++
++#include <algorithm>
++#include <cstdint>
++#include <unordered_map>
++#include <vector>
++
++#include "cpu/valuepred/memory_renaming_core.hh"
++
++namespace gem5
++{
++
++namespace valuepred
++{
++
++namespace test
++{
++
++/** Default MemoryRenamingCore parameters used across the test suite. */
++inline MemoryRenamingCore<int> *
++createDefaultCore()
++{
++    return new MemoryRenamingCore<int>(
++        4,      // ways
++        1024,   // entryCounts (log2=10)
++        16,     // tagWidth
++        10,     // logESTBEntrys
++        2,      // logMaxConfidence (max=3)
++        2,      // confidenceThreshold
++        1,      // allocationConfidence
++        1,      // reallocationConfidence
++        1,      // demotionPenalty
++        8,      // mrtQueueCapacity
++        true,   // enableDynamic
++        true,   // enableStatic
++        1       // numThreads
++    );
++}
++
++/**
++ * Simulates MemoryRenaming rename-stage hooks (renameStore, renameLoad,
++ * writebackReg, completeLoadLSU, squash) using integer physical register
++ * indices and an in-memory scoreboard.
++ */
++class RenamePipelineHarness
++{
++  public:
++    MemoryRenamingCore<int> core;
++    ThreadID tid = 0;
++
++    std::unordered_map<int, uint64_t> physRegs;
++    std::unordered_map<int, bool> scoreboard;
++
++    struct PendingLoad
++    {
++        InstSeqNum loadSeq = 0;
++        int ldPhysReg = -1;
++        uint64_t predictedVal = 0;
++        bool speculative = false;
++    };
++    std::unordered_map<int, std::vector<PendingLoad>> pendingLoads;
++
++    struct LoadPrediction
++    {
++        InstSeqNum loadSeq = 0;
++        int ldPhysReg = -1;
++        uint64_t predictedVal = 0;
++        bool speculative = false;
++    };
++    std::vector<LoadPrediction> renamePredictions;
++
++    explicit RenamePipelineHarness(MemoryRenamingCore<int> *c) : core(*c) {}
++
++    void setRegReady(int physReg, uint64_t val)
++    {
++        physRegs[physReg] = val;
++        scoreboard[physReg] = true;
++    }
++
++    void renameStore(Addr storePC, InstSeqNum seqNum, int stPhysReg,
++                     bool srcReady, uint64_t srcVal, uint8_t size = 8,
++                     bool trackSRP = false, int64_t spOffset = 0)
++    {
++        core.insertStore(storePC, seqNum, tid, size, stPhysReg, srcReady, srcVal);
++        if (trackSRP) {
++            core.pushSRP(tid, storePC, seqNum, size, spOffset, stPhysReg);
++        }
++    }
++
++    bool renameLoad(Addr loadPC, InstSeqNum seqNum, int ldPhysReg,
++                    uint8_t size = 8, bool isPop = false, bool isPeek = false,
++                    int64_t disp = 0)
++    {
++        bool speculative = false, ready = false;
++        Addr data = 0;
++        int stReg = 0;
++        bool hit = core.matchLoad(loadPC, size, tid, seqNum, isPop, isPeek, disp,
++                                  speculative, data, stReg, ready);
++        if (!hit) {
++            return false;
++        }
++        if (ready) {
++            physRegs[ldPhysReg] = data;
++            scoreboard[ldPhysReg] = true;
++            LoadPrediction pred;
++            pred.loadSeq = seqNum;
++            pred.ldPhysReg = ldPhysReg;
++            pred.predictedVal = data;
++            pred.speculative = true;
++            renamePredictions.push_back(pred);
++        } else {
++            PendingLoad pending;
++            pending.loadSeq = seqNum;
++            pending.ldPhysReg = ldPhysReg;
++            pending.speculative = true;
++            pendingLoads[stReg].push_back(pending);
++
++            LoadPrediction pred;
++            pred.loadSeq = seqNum;
++            pred.ldPhysReg = ldPhysReg;
++            pred.speculative = true;
++            renamePredictions.push_back(pred);
++        }
++        return true;
++    }
++
++    void writebackReg(int stPhysReg, uint64_t val)
++    {
++        core.updateMRTData(stPhysReg, val);
++        auto it = pendingLoads.find(stPhysReg);
++        if (it == pendingLoads.end()) {
++            return;
++        }
++        for (auto &load : it->second) {
++            load.predictedVal = val;
++            load.speculative = true;
++            physRegs[load.ldPhysReg] = val;
++            scoreboard[load.ldPhysReg] = true;
++            for (auto &pred : renamePredictions) {
++                if (pred.loadSeq == load.loadSeq) {
++                    pred.predictedVal = val;
++                }
++            }
++        }
++        pendingLoads.erase(it);
++    }
++
++    void completeLoadLSU(InstSeqNum loadSeq)
++    {
++        for (auto &pair : pendingLoads) {
++            auto &list = pair.second;
++            list.erase(
++                std::remove_if(list.begin(), list.end(),
++                               [loadSeq](const PendingLoad &l) {
++                                   return l.loadSeq == loadSeq;
++                               }),
++                list.end());
++        }
++    }
++
++    void squash(InstSeqNum squashSn)
++    {
++        core.squash(tid, squashSn);
++        for (auto &pair : pendingLoads) {
++            auto &list = pair.second;
++            list.erase(
++                std::remove_if(list.begin(), list.end(),
++                               [squashSn](const PendingLoad &l) {
++                                   return l.loadSeq > squashSn;
++                               }),
++                list.end());
++        }
++    }
++
++    /**
++     * Mirrors IEW bypassWriteback verification: compare LSU value against the
++     * predicted rename-time value for a load that was speculatively renamed.
++     */
++    bool verifyLoadWriteback(InstSeqNum loadSeq, int ldPhysReg,
++                             uint64_t actualVal, bool &misprediction)
++    {
++        misprediction = false;
++        for (const auto &pred : renamePredictions) {
++            if (pred.loadSeq == loadSeq) {
++                if (pred.speculative && pred.predictedVal != actualVal) {
++                    misprediction = true;
++                }
++                physRegs[ldPhysReg] = actualVal;
++                scoreboard[ldPhysReg] = true;
++                completeLoadLSU(loadSeq);
++                return true;
++            }
++        }
++        return false;
++    }
++
++    size_t pendingCount() const
++    {
++        size_t total = 0;
++        for (const auto &pair : pendingLoads) {
++            total += pair.second.size();
++        }
++        return total;
++    }
++};
++
++/**
++ * Simulates Commit-stage Memory Renaming hooks: store commit tracking,
++ * load retirement training (MemoryRenaming::update), VPcorrect accounting,
++ * and squash-after on value misprediction at the instruction boundary.
++ */
++class CommitPipelineHarness
++{
++  public:
++    MemoryRenamingCore<int> &core;
++    ThreadID tid = 0;
++
++    uint64_t vpCorrect = 0;
++
++    struct LoadCommitResult
++    {
++        bool trained = false;
++        bool demoted = false;
++        int producerOffset = -1;
++        bool squashPending = false;
++        bool squashTriggered = false;
++        InstSeqNum squashAfterSn = 0;
++    };
++
++    explicit CommitPipelineHarness(MemoryRenamingCore<int> &c) : core(c) {}
++
++    void commitStore(Addr pc, InstSeqNum seqNum)
++    {
++        core.commitStore(pc, seqNum);
++    }
++
++    /**
++     * Mirrors MemoryRenaming::update() plus commit.cc misprediction handling.
++     * Call finishInstBoundary() when the committing uop is on an instruction
++     * boundary to model squash-after.
++     */
++    LoadCommitResult commitLoad(Addr loadPC, InstSeqNum loadSeqNum,
++                                bool hasProducer, Addr storePC,
++                                InstSeqNum storeSeqNum,
++                                bool vpSpeculative, bool vpMisprediction,
++                                uint64_t predictedVal = 0,
++                                uint64_t actualVal = 0)
++    {
++        LoadCommitResult result;
++
++        if (hasProducer) {
++            result.producerOffset = core.getProducerOffset(storeSeqNum, storePC);
++            if (result.producerOffset >= 0) {
++                core.trainMRP(loadPC, storePC, result.producerOffset, true);
++                result.trained = true;
++            } else {
++                core.trainMRP(loadPC, 0, 0, false);
++                result.demoted = true;
++            }
++        } else {
++            core.trainMRP(loadPC, 0, 0, false);
++            result.demoted = true;
++        }
++
++        core.retireSRP(tid, loadSeqNum);
++
++        if (vpSpeculative && !vpMisprediction) {
++            vpCorrect++;
++        }
++
++        if (vpMisprediction) {
++            valuePredictionSquash = true;
++            squashAfterSn = loadSeqNum;
++            result.squashPending = true;
++            result.squashAfterSn = loadSeqNum;
++        }
++
++        (void)predictedVal;
++        (void)actualVal;
++        return result;
++    }
++
++    /** Mirrors commit.cc squash-after at onInstBoundary. */
++    bool finishInstBoundary()
++    {
++        if (!valuePredictionSquash) {
++            return false;
++        }
++        lastSquashAfterSn = squashAfterSn;
++        valuePredictionSquash = false;
++        return true;
++    }
++
++    bool isSquashPending() const { return valuePredictionSquash; }
++    InstSeqNum getLastSquashAfterSn() const { return lastSquashAfterSn; }
++
++  private:
++    bool valuePredictionSquash = false;
++    InstSeqNum squashAfterSn = 0;
++    InstSeqNum lastSquashAfterSn = 0;
++};
++
++} // namespace test
++} // namespace valuepred
++} // namespace gem5
++
++#endif // __CPU_VALUEPRED_MEMORY_RENAMING_PIPELINE_HARNESS_HH__
+diff --git a/src/cpu/valuepred/memory_renaming_rename_pipeline.test.cc b/src/cpu/valuepred/memory_renaming_rename_pipeline.test.cc
+new file mode 100644
+index 0000000000..40e43c9344
+--- /dev/null
++++ b/src/cpu/valuepred/memory_renaming_rename_pipeline.test.cc
+@@ -0,0 +1,169 @@
++#include <gtest/gtest.h>
++
++#include "cpu/valuepred/memory_renaming_pipeline_harness.hh"
++
++using namespace gem5;
++using namespace gem5::valuepred;
++using namespace gem5::valuepred::test;
++
++class RenamePipelineTest : public ::testing::Test
++{
++  protected:
++    MemoryRenamingCore<int> *core = nullptr;
++
++    void SetUp() override { core = createDefaultCore(); }
++    void TearDown() override { delete core; core = nullptr; }
++};
++
++TEST_F(RenamePipelineTest, CaseAImmediateInjection)
++{
++    RenamePipelineHarness harness(core);
++
++    Addr storePC = 0x1000;
++    Addr loadPC = 0x1500;
++
++    harness.renameStore(storePC, 10, 5, true, 0xCAFE);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++
++    EXPECT_TRUE(harness.renameLoad(loadPC, 12, 8));
++    EXPECT_TRUE(harness.scoreboard[8]);
++    EXPECT_EQ(harness.physRegs[8], 0xCAFE);
++}
++
++TEST_F(RenamePipelineTest, CaseBPendingWriteback)
++{
++    RenamePipelineHarness harness(core);
++
++    Addr storePC = 0x1000;
++    Addr loadPC = 0x1500;
++
++    harness.renameStore(storePC, 10, 5, false, 0);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++
++    EXPECT_TRUE(harness.renameLoad(loadPC, 12, 8));
++    EXPECT_FALSE(harness.scoreboard[8]);
++    EXPECT_EQ(harness.pendingCount(), 1u);
++
++    harness.writebackReg(5, 0x12345678);
++    EXPECT_EQ(harness.pendingCount(), 0u);
++    EXPECT_TRUE(harness.scoreboard[8]);
++    EXPECT_EQ(harness.physRegs[8], 0x12345678);
++}
++
++TEST_F(RenamePipelineTest, MultiplePendingLoads)
++{
++    RenamePipelineHarness harness(core);
++
++    Addr storePC = 0x1000;
++    Addr loadPC1 = 0x1500;
++    Addr loadPC2 = 0x1600;
++
++    harness.renameStore(storePC, 10, 5, false, 0);
++    harness.core.trainMRP(loadPC1, storePC, 0, true);
++    harness.core.trainMRP(loadPC1, storePC, 0, true);
++    harness.core.trainMRP(loadPC2, storePC, 0, true);
++    harness.core.trainMRP(loadPC2, storePC, 0, true);
++
++    EXPECT_TRUE(harness.renameLoad(loadPC1, 12, 8));
++    EXPECT_TRUE(harness.renameLoad(loadPC2, 13, 9));
++    EXPECT_EQ(harness.pendingCount(), 2u);
++
++    harness.writebackReg(5, 0xABCDEF00);
++    EXPECT_EQ(harness.pendingCount(), 0u);
++    EXPECT_EQ(harness.physRegs[8], 0xABCDEF00);
++    EXPECT_EQ(harness.physRegs[9], 0xABCDEF00);
++}
++
++TEST_F(RenamePipelineTest, LSUCompletionRace)
++{
++    RenamePipelineHarness harness(core);
++
++    Addr storePC = 0x1000;
++    Addr loadPC = 0x1500;
++
++    harness.renameStore(storePC, 10, 5, false, 0);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++    EXPECT_TRUE(harness.renameLoad(loadPC, 12, 8));
++    EXPECT_EQ(harness.pendingCount(), 1u);
++
++    harness.physRegs[8] = 0x99998888;
++    harness.scoreboard[8] = true;
++    harness.completeLoadLSU(12);
++    EXPECT_EQ(harness.pendingCount(), 0u);
++
++    harness.writebackReg(5, 0x11112222);
++    EXPECT_EQ(harness.physRegs[8], 0x99998888);
++}
++
++TEST_F(RenamePipelineTest, SquashCleansPendingAndTables)
++{
++    RenamePipelineHarness harness(core);
++
++    harness.renameStore(0x1000, 10, 5, false, 0, 8, true, -8);
++    harness.renameStore(0x1100, 15, 6, false, 0, 8, true, -16);
++    harness.core.trainMRP(0x2000, 0x1100, 0, true);
++    harness.core.trainMRP(0x2000, 0x1100, 0, true);
++    EXPECT_TRUE(harness.renameLoad(0x2000, 18, 8, 8, true));
++
++    EXPECT_EQ(harness.pendingCount(), 1u);
++    EXPECT_EQ(harness.core.srpStacks[0].size(), 2u);
++
++    harness.squash(13);
++    EXPECT_EQ(harness.pendingCount(), 0u);
++    EXPECT_EQ(harness.core.srpStacks[0].size(), 1u);
++    EXPECT_EQ(harness.core.mrtTable[0x1100].count, 0);
++}
++
++TEST_F(RenamePipelineTest, SRPStaticPath)
++{
++    RenamePipelineHarness harness(core);
++
++    harness.renameStore(0x1000, 10, 5, true, 0x42, 8, true, -8);
++    EXPECT_TRUE(harness.renameLoad(0x2000, 15, 8, 8, true));
++    EXPECT_EQ(harness.physRegs[8], 0x42);
++}
++
++TEST_F(RenamePipelineTest, WritebackVerificationMisprediction)
++{
++    RenamePipelineHarness harness(core);
++
++    Addr storePC = 0x1000;
++    Addr loadPC = 0x1500;
++
++    harness.renameStore(storePC, 10, 5, false, 0);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++    EXPECT_TRUE(harness.renameLoad(loadPC, 12, 8));
++
++    harness.writebackReg(5, 0xBAD);
++    EXPECT_EQ(harness.physRegs[8], 0xBAD);
++
++    bool mispred = false;
++    harness.verifyLoadWriteback(12, 8, 0x600D, mispred);
++    EXPECT_TRUE(mispred);
++    EXPECT_EQ(harness.physRegs[8], 0x600D);
++}
++
++TEST_F(RenamePipelineTest, RenameCommitIntegration)
++{
++    RenamePipelineHarness rename(core);
++    CommitPipelineHarness commit(rename.core);
++
++    Addr storePC = 0x1000;
++    Addr loadPC = 0x1500;
++
++    rename.renameStore(storePC, 10, 5, true, 0xCAFE);
++    rename.core.trainMRP(loadPC, storePC, 0, true);
++    rename.core.trainMRP(loadPC, storePC, 0, true);
++    EXPECT_TRUE(rename.renameLoad(loadPC, 12, 8));
++
++    commit.commitStore(storePC, 10);
++    auto result = commit.commitLoad(loadPC, 12, true, storePC, 10,
++                                    true, false);
++    EXPECT_TRUE(result.trained);
++    EXPECT_EQ(result.producerOffset, 0);
++    EXPECT_EQ(commit.vpCorrect, 1u);
++}
 diff --git a/src/cpu/valuepred/valuepred_metadata.hh b/src/cpu/valuepred/valuepred_metadata.hh
 new file mode 100644
 index 0000000000..a81aa97a24
