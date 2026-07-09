@@ -677,10 +677,10 @@ index 0000000000..93a8591ada
 +    enableStatic = Param.Bool(True, "Enable static Memory Renaming path (SRP)")
 diff --git a/src/cpu/valuepred/memory_renaming.cc b/src/cpu/valuepred/memory_renaming.cc
 new file mode 100644
-index 0000000000..227da2111a
+index 0000000000..0115fd93e1
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.cc
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,249 @@
 +#include "cpu/valuepred/memory_renaming.hh"
 +
 +#include <algorithm>
@@ -754,19 +754,18 @@ index 0000000000..227da2111a
 +    // SRP Stack Tracking for Pushes/Calls
 +    if (core.enableStatic) {
 +        RegIndex baseReg = ldst ? ldst->base : (ldstFp ? ldstFp->base : X86ISA::int_reg::NumArchRegs);
-+        if (baseReg == X86ISA::int_reg::_RspIdx || baseReg == X86ISA::int_reg::_RbpIdx) {
-+            bool isPush = false;
++        std::string macroMnem;
++        if (inst->macroop) {
++            macroMnem = inst->macroop->getName();
++        }
++        auto stackInfo = classifyStackAccess(
++            core.enableStatic, false, true, baseReg,
++            X86ISA::int_reg::_RspIdx, X86ISA::int_reg::_RbpIdx, macroMnem);
++        if (stackInfo.isStackBase) {
 +            int64_t disp = ldst ? ldst->disp : (ldstFp ? ldstFp->disp : 0);
-+            if (inst->macroop) {
-+                std::string mnem = inst->macroop->getName();
-+                std::transform(mnem.begin(), mnem.end(), mnem.begin(), ::tolower);
-+                if (mnem == "push" || mnem == "call") {
-+                    isPush = true;
-+                }
-+            }
 +            core.pushSRP(tid, storePC, inst->seqNum, size, disp, st_physreg);
 +            DPRINTF(MemoryRenaming, "Rename SRP-Push [sn:%lu] PC %lx type:%s offset:%ld\n",
-+                    inst->seqNum, storePC, isPush ? "Push" : "Store", disp);
++                    inst->seqNum, storePC, stackInfo.isPush ? "Push" : "Store", disp);
 +        }
 +    }
 +}
@@ -788,18 +787,15 @@ index 0000000000..227da2111a
 +
 +    bool isPop = false;
 +    bool isPeek = false;
-+    if (core.enableStatic && (baseReg == X86ISA::int_reg::_RspIdx || baseReg == X86ISA::int_reg::_RbpIdx)) {
-+        if (inst->macroop) {
-+            std::string mnem = inst->macroop->getName();
-+            std::transform(mnem.begin(), mnem.end(), mnem.begin(), ::tolower);
-+            if (mnem == "pop" || mnem == "ret") {
-+                isPop = true;
-+            }
-+        }
-+        if (!isPop) {
-+            isPeek = true;
-+        }
++    std::string macroMnem;
++    if (inst->macroop) {
++        macroMnem = inst->macroop->getName();
 +    }
++    auto stackInfo = classifyStackAccess(
++        core.enableStatic, true, false, baseReg,
++        X86ISA::int_reg::_RspIdx, X86ISA::int_reg::_RbpIdx, macroMnem);
++    isPop = stackInfo.isPop;
++    isPeek = stackInfo.isPeek;
 +
 +    bool speculative = false;
 +    Addr predictedVal = 0;
@@ -1017,10 +1013,10 @@ index 0000000000..9664cb134f
 +#endif // __CPU_VALUEPRED_MEMORY_RENAMING_HH__
 diff --git a/src/cpu/valuepred/memory_renaming.test.cc b/src/cpu/valuepred/memory_renaming.test.cc
 new file mode 100644
-index 0000000000..c30439d81f
+index 0000000000..4da89cd6e0
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.test.cc
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,894 @@
 +#include <gtest/gtest.h>
 +#include <random>
 +#include <vector>
@@ -1077,7 +1073,6 @@ index 0000000000..c30439d81f
 +    // So lookupMRP should return hit = false or not active prediction
 +    hit = core->lookupMRP(loadPC, outFrozen);
 +    // Note: lookupMRP only checks if the entry is frozen. Let's inspect the tables directly.
-+    uint32_t setIdx = core->pcHashToWayIndex(loadPC, 0); // we will check where it landed
 +    int way = -1;
 +    for (int i = 0; i < core->ways; i++) {
 +        uint32_t idx = core->pcHashToWayIndex(loadPC, i);
@@ -1359,6 +1354,47 @@ index 0000000000..c30439d81f
 +}
 +
 +// ============================================================================
++// 3b. Stack Access Classification Tests
++// ============================================================================
++
++TEST_F(MemoryRenamingCoreTest, StackAccessClassification)
++{
++    const int rsp = 4;
++    const int rbp = 5;
++    const int rax = 0;
++
++    auto push = classifyStackAccess(true, false, true, rsp, rsp, rbp, "push");
++    EXPECT_TRUE(push.isStackBase);
++    EXPECT_TRUE(push.isPush);
++    EXPECT_FALSE(push.isPop);
++    EXPECT_FALSE(push.isPeek);
++
++    auto call = classifyStackAccess(true, false, true, rsp, rsp, rbp, "call");
++    EXPECT_TRUE(call.isPush);
++
++    auto pop = classifyStackAccess(true, true, false, rsp, rsp, rbp, "pop");
++    EXPECT_TRUE(pop.isPop);
++    EXPECT_FALSE(pop.isPeek);
++
++    auto ret = classifyStackAccess(true, true, false, rsp, rsp, rbp, "ret");
++    EXPECT_TRUE(ret.isPop);
++
++    auto peek = classifyStackAccess(true, true, false, rsp, rsp, rbp, "mov");
++    EXPECT_TRUE(peek.isPeek);
++    EXPECT_FALSE(peek.isPop);
++
++    auto stackStore = classifyStackAccess(true, false, true, rbp, rsp, rbp, "mov");
++    EXPECT_TRUE(stackStore.isStackBase);
++    EXPECT_FALSE(stackStore.isPush);
++
++    auto nonStack = classifyStackAccess(true, true, false, rax, rsp, rbp, "mov");
++    EXPECT_FALSE(nonStack.isStackBase);
++
++    auto disabled = classifyStackAccess(false, true, false, rsp, rsp, rbp, "pop");
++    EXPECT_FALSE(disabled.isStackBase);
++}
++
++// ============================================================================
 +// 3. SRP-Stack LIFO & Peek Matching Tests
 +// ============================================================================
 +
@@ -1482,6 +1518,76 @@ index 0000000000..c30439d81f
 +}
 +
 +// ============================================================================
++// 4b. Dynamic MRT Offset Selection & Commit Offset Tests
++// ============================================================================
++
++TEST_F(MemoryRenamingCoreTest, DynamicMRTOffsetSelection)
++{
++    auto core = createDefaultCore();
++    ThreadID tid = 0;
++    Addr storePC = 0x2000;
++    Addr loadPC = 0x3000;
++
++    for (int i = 0; i < 3; i++) {
++        core->insertStore(storePC, 100 + i, tid, 8, 10 + i, true, 0x1000 + i);
++    }
++
++    // Train MRP to predict offset 1 (second-most-recent store)
++    core->trainMRP(loadPC, storePC, 0, true);
++    core->trainMRP(loadPC, storePC, 1, true);
++    core->trainMRP(loadPC, storePC, 1, true);
++
++    bool spec = false, ready = false;
++    Addr data = 0;
++    int stReg = 0;
++    bool hit = core->matchLoad(loadPC, 8, tid, 200, false, false, 0,
++                               spec, data, stReg, ready);
++    EXPECT_TRUE(hit);
++    EXPECT_TRUE(spec);
++    EXPECT_EQ(data, 0x1001);
++    EXPECT_EQ(stReg, 11);
++
++    delete core;
++}
++
++TEST_F(MemoryRenamingCoreTest, CommitProducerOffset)
++{
++    auto core = createDefaultCore();
++
++    core->commitStore(0x1000, 10);
++    core->commitStore(0x1100, 12);
++    core->commitStore(0x1200, 15);
++
++    EXPECT_EQ(core->getProducerOffset(15), 0);
++    EXPECT_EQ(core->getProducerOffset(12), 1);
++    EXPECT_EQ(core->getProducerOffset(10), 2);
++    EXPECT_EQ(core->getProducerOffset(99), -1);
++
++    delete core;
++}
++
++TEST_F(MemoryRenamingCoreTest, DynamicPathSizeMismatchSuppression)
++{
++    auto core = createDefaultCore();
++    ThreadID tid = 0;
++    Addr storePC = 0x2000;
++    Addr loadPC = 0x3000;
++
++    core->insertStore(storePC, 10, tid, 8, 5, true, 0xDEAD);
++    core->trainMRP(loadPC, storePC, 0, true);
++    core->trainMRP(loadPC, storePC, 0, true);
++
++    bool spec = false, ready = false;
++    Addr data = 0;
++    int stReg = 0;
++    bool hit = core->matchLoad(loadPC, 4, tid, 12, false, false, 0,
++                               spec, data, stReg, ready);
++    EXPECT_FALSE(hit);
++
++    delete core;
++}
++
++// ============================================================================
 +// 5. Squash Rollback Tests
 +// ============================================================================
 +
@@ -1536,119 +1642,289 @@ index 0000000000..c30439d81f
 +}
 +
 +// ============================================================================
-+// 6. Integration-Lite pipeline test to catch the actual value bug
++// 6. Rename-Stage Pipeline Harness (mocked rename unit integration)
 +// ============================================================================
 +
-+struct MockDynInst
++/**
++ * Simulates the MemoryRenaming rename-stage contract using integer physical
++ * register indices instead of gem5 DynInst / SimObject dependencies. This
++ * exercises MRP+SRP+MRT together with the pending-load queue, writeback hook,
++ * LSU completion cleanup, and squash rollback — the same stimulus/response
++ * pattern Rename applies to MemoryRenaming in the O3 pipeline.
++ */
++class RenamePipelineHarness
 +{
-+    Addr pc = 0;
-+    InstSeqNum seqNum = 0;
-+    uint8_t size = 8;
-+    int renamedSrcReg = -1;
-+    int renamedDestReg = -1;
-+    bool isStoreInst = false;
-+    bool isLoadInst = false;
-+
-+    struct VPResult {
-+        bool speculative = false;
-+        Addr value = 0;
-+    } vpResult;
-+
-+    Addr actualValue = 0xdeadbeefULL; // Default uninitialized
-+    bool vpMisprediction = false;
-+};
-+
-+TEST_F(MemoryRenamingCoreTest, PipelineIntegrationLiteActualValueProp)
-+{
-+    auto core = createDefaultCore();
++  public:
++    MemoryRenamingCore<int> core;
 +    ThreadID tid = 0;
 +
-+    // We simulate the lifecycle of two instructions: a store and a load.
-+    auto storeInst = std::make_shared<MockDynInst>();
-+    storeInst->pc = 0x1000;
-+    storeInst->seqNum = 10;
-+    storeInst->size = 8;
-+    storeInst->renamedSrcReg = 5;
-+    storeInst->isStoreInst = true;
++    std::unordered_map<int, uint64_t> physRegs;
++    std::unordered_map<int, bool> scoreboard;
 +
-+    auto loadInst = std::make_shared<MockDynInst>();
-+    loadInst->pc = 0x1500;
-+    loadInst->seqNum = 12;
-+    loadInst->size = 8;
-+    loadInst->renamedDestReg = 8;
-+    loadInst->isLoadInst = true;
++    struct PendingLoad
++    {
++        InstSeqNum loadSeq = 0;
++        int ldPhysReg = -1;
++        uint64_t predictedVal = 0;
++        bool speculative = false;
++    };
++    std::unordered_map<int, std::vector<PendingLoad>> pendingLoads;
 +
-+    // --- 1. Rename Stage ---
-+    // Rename Store
-+    core->insertStore(storeInst->pc, storeInst->seqNum, tid, storeInst->size, storeInst->renamedSrcReg, false, 0);
++    explicit RenamePipelineHarness(MemoryRenamingCore<int> *c) : core(*c) {}
 +
-+    // Train MRP so load can hit
-+    core->trainMRP(loadInst->pc, storeInst->pc, 0, true);
-+    core->trainMRP(loadInst->pc, storeInst->pc, 0, true); // promote confidence
-+
-+    // Rename Load
-+    bool speculative = false, ready = false;
-+    Addr data = 0;
-+    int stReg = 0;
-+    bool hit = core->matchLoad(loadInst->pc, loadInst->size, tid, loadInst->seqNum, false, false, 0,
-+                               speculative, data, stReg, ready);
-+    EXPECT_TRUE(hit);
-+    loadInst->vpResult.speculative = speculative;
-+    loadInst->vpResult.value = data;
-+
-+    // --- 2. Execution / Writeback Stage ---
-+    // Store completes and writes back value 0x12345678 to physical register 5
-+    Addr realStoreValue = 0x12345678;
-+    core->updateMRTData(5, realStoreValue);
-+    // Pending queue would propagate this value to the load
-+    loadInst->vpResult.value = realStoreValue;
-+
-+    // --- 3. LSQ Completion Stage ---
-+    Addr realLoadValue = 0x12345678;
-+
-+    // Demonstrating the bug (Scenario A):
-+    // If the bug is present, inst->actualValue is NOT updated, leaving it at 0xdeadbeefULL.
-+    bool bugPresent = true;
-+    if (bugPresent) {
-+        // inst->actualValue is NOT written here!
-+    } else {
-+        loadInst->actualValue = realLoadValue;
++    void setRegReady(int physReg, uint64_t val)
++    {
++        physRegs[physReg] = val;
++        scoreboard[physReg] = true;
 +    }
-+    // Verify that due to the bug, loadInst's actualValue remains 0xdeadbeefULL
-+    EXPECT_EQ(loadInst->actualValue, 0xdeadbeefULL);
 +
-+    // Fixing the bug (Scenario B):
-+    bugPresent = false;
-+    if (bugPresent) {
-+        // inst->actualValue is NOT written here!
-+    } else {
-+        loadInst->actualValue = realLoadValue;
++    void renameStore(Addr storePC, InstSeqNum seqNum, int stPhysReg,
++                     bool srcReady, uint64_t srcVal, uint8_t size = 8,
++                     bool trackSRP = false, int64_t spOffset = 0)
++    {
++        core.insertStore(storePC, seqNum, tid, size, stPhysReg, srcReady, srcVal);
++        if (trackSRP) {
++            core.pushSRP(tid, storePC, seqNum, size, spOffset, stPhysReg);
++        }
 +    }
-+    // Verify that once fixed, loadInst's actualValue correctly matches realLoadValue
-+    EXPECT_EQ(loadInst->actualValue, realStoreValue);
 +
-+    // --- 4. Commit Stage ---
-+    core->commitStore(storeInst->pc, storeInst->seqNum);
++    bool renameLoad(Addr loadPC, InstSeqNum seqNum, int ldPhysReg,
++                    uint8_t size = 8, bool isPop = false, bool isPeek = false,
++                    int64_t disp = 0)
++    {
++        bool speculative = false, ready = false;
++        Addr data = 0;
++        int stReg = 0;
++        bool hit = core.matchLoad(loadPC, size, tid, seqNum, isPop, isPeek, disp,
++                                  speculative, data, stReg, ready);
++        if (!hit) {
++            return false;
++        }
++        if (ready) {
++            physRegs[ldPhysReg] = data;
++            scoreboard[ldPhysReg] = true;
++        } else {
++            PendingLoad pending;
++            pending.loadSeq = seqNum;
++            pending.ldPhysReg = ldPhysReg;
++            pending.speculative = true;
++            pendingLoads[stReg].push_back(pending);
++        }
++        return true;
++    }
 +
-+    // If the bug were present, the commit stage would construct updateInfo with
-+    // actualValue = 0xdeadbeefULL.
-+    EXPECT_EQ(loadInst->actualValue, 0x12345678);
++    void writebackReg(int stPhysReg, uint64_t val)
++    {
++        core.updateMRTData(stPhysReg, val);
++        auto it = pendingLoads.find(stPhysReg);
++        if (it == pendingLoads.end()) {
++            return;
++        }
++        for (auto &load : it->second) {
++            load.predictedVal = val;
++            load.speculative = true;
++            physRegs[load.ldPhysReg] = val;
++            scoreboard[load.ldPhysReg] = true;
++        }
++        pendingLoads.erase(it);
++    }
++
++    void completeLoadLSU(InstSeqNum loadSeq)
++    {
++        for (auto &pair : pendingLoads) {
++            auto &list = pair.second;
++            list.erase(
++                std::remove_if(list.begin(), list.end(),
++                               [loadSeq](const PendingLoad &l) {
++                                   return l.loadSeq == loadSeq;
++                               }),
++                list.end());
++        }
++    }
++
++    void squash(InstSeqNum squashSn)
++    {
++        core.squash(tid, squashSn);
++        for (auto &pair : pendingLoads) {
++            auto &list = pair.second;
++            list.erase(
++                std::remove_if(list.begin(), list.end(),
++                               [squashSn](const PendingLoad &l) {
++                                   return l.loadSeq > squashSn;
++                               }),
++                list.end());
++        }
++    }
++
++    void commitLoad(Addr loadPC, Addr storePC, InstSeqNum storeSeqNum,
++                    InstSeqNum loadSeqNum)
++    {
++        int offset = core.getProducerOffset(storeSeqNum);
++        if (offset >= 0) {
++            core.trainMRP(loadPC, storePC, offset, true);
++        } else {
++            core.trainMRP(loadPC, 0, 0, false);
++        }
++        core.retireSRP(tid, loadSeqNum);
++    }
++
++    size_t pendingCount() const
++    {
++        size_t total = 0;
++        for (const auto &pair : pendingLoads) {
++            total += pair.second.size();
++        }
++        return total;
++    }
++};
++
++TEST_F(MemoryRenamingCoreTest, RenameHarnessCaseAImmediateInjection)
++{
++    auto core = createDefaultCore();
++    RenamePipelineHarness harness(core);
++
++    Addr storePC = 0x1000;
++    Addr loadPC = 0x1500;
++
++    harness.renameStore(storePC, 10, 5, true, 0xCAFE);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++
++    EXPECT_TRUE(harness.renameLoad(loadPC, 12, 8));
++    EXPECT_TRUE(harness.scoreboard[8]);
++    EXPECT_EQ(harness.physRegs[8], 0xCAFE);
++
++    harness.commitLoad(loadPC, storePC, 10, 12);
++    delete core;
++}
++
++TEST_F(MemoryRenamingCoreTest, RenameHarnessCaseBPendingWriteback)
++{
++    auto core = createDefaultCore();
++    RenamePipelineHarness harness(core);
++
++    Addr storePC = 0x1000;
++    Addr loadPC = 0x1500;
++
++    // Store source register not ready at rename
++    harness.renameStore(storePC, 10, 5, false, 0);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++
++    EXPECT_TRUE(harness.renameLoad(loadPC, 12, 8));
++    EXPECT_FALSE(harness.scoreboard[8]);
++    EXPECT_EQ(harness.pendingCount(), 1u);
++
++    harness.writebackReg(5, 0x12345678);
++    EXPECT_EQ(harness.pendingCount(), 0u);
++    EXPECT_TRUE(harness.scoreboard[8]);
++    EXPECT_EQ(harness.physRegs[8], 0x12345678);
++
++    delete core;
++}
++
++TEST_F(MemoryRenamingCoreTest, RenameHarnessMultiplePendingLoads)
++{
++    auto core = createDefaultCore();
++    RenamePipelineHarness harness(core);
++
++    Addr storePC = 0x1000;
++    Addr loadPC1 = 0x1500;
++    Addr loadPC2 = 0x1600;
++
++    harness.renameStore(storePC, 10, 5, false, 0);
++    harness.core.trainMRP(loadPC1, storePC, 0, true);
++    harness.core.trainMRP(loadPC1, storePC, 0, true);
++    harness.core.trainMRP(loadPC2, storePC, 0, true);
++    harness.core.trainMRP(loadPC2, storePC, 0, true);
++
++    EXPECT_TRUE(harness.renameLoad(loadPC1, 12, 8));
++    EXPECT_TRUE(harness.renameLoad(loadPC2, 13, 9));
++    EXPECT_EQ(harness.pendingCount(), 2u);
++
++    harness.writebackReg(5, 0xABCDEF00);
++    EXPECT_EQ(harness.pendingCount(), 0u);
++    EXPECT_EQ(harness.physRegs[8], 0xABCDEF00);
++    EXPECT_EQ(harness.physRegs[9], 0xABCDEF00);
++
++    delete core;
++}
++
++TEST_F(MemoryRenamingCoreTest, RenameHarnessLSUCompletionRace)
++{
++    auto core = createDefaultCore();
++    RenamePipelineHarness harness(core);
++
++    Addr storePC = 0x1000;
++    Addr loadPC = 0x1500;
++
++    harness.renameStore(storePC, 10, 5, false, 0);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++    EXPECT_TRUE(harness.renameLoad(loadPC, 12, 8));
++    EXPECT_EQ(harness.pendingCount(), 1u);
++
++    // LSU completes first with the correct value
++    harness.physRegs[8] = 0x99998888;
++    harness.scoreboard[8] = true;
++    harness.completeLoadLSU(12);
++    EXPECT_EQ(harness.pendingCount(), 0u);
++
++    // Late store writeback must not corrupt the LSU result
++    harness.writebackReg(5, 0x11112222);
++    EXPECT_EQ(harness.physRegs[8], 0x99998888);
++
++    delete core;
++}
++
++TEST_F(MemoryRenamingCoreTest, RenameHarnessSquashCleansPendingAndTables)
++{
++    auto core = createDefaultCore();
++    RenamePipelineHarness harness(core);
++
++    harness.renameStore(0x1000, 10, 5, false, 0, 8, true, -8);
++    harness.renameStore(0x1100, 15, 6, false, 0, 8, true, -16);
++    harness.core.trainMRP(0x2000, 0x1100, 0, true);
++    harness.core.trainMRP(0x2000, 0x1100, 0, true);
++    EXPECT_TRUE(harness.renameLoad(0x2000, 18, 8, 8, true));
++
++    EXPECT_EQ(harness.pendingCount(), 1u);
++    EXPECT_EQ(harness.core.srpStacks[0].size(), 2u);
++
++    harness.squash(13);
++    EXPECT_EQ(harness.pendingCount(), 0u);
++    EXPECT_EQ(harness.core.srpStacks[0].size(), 1u);
++    EXPECT_EQ(harness.core.mrtTable[0x1100].count, 0);
++
++    delete core;
++}
++
++TEST_F(MemoryRenamingCoreTest, RenameHarnessSRPStaticPath)
++{
++    auto core = createDefaultCore();
++    RenamePipelineHarness harness(core);
++
++    harness.renameStore(0x1000, 10, 5, true, 0x42, 8, true, -8);
++    EXPECT_TRUE(harness.renameLoad(0x2000, 15, 8, 8, true));
++    EXPECT_EQ(harness.physRegs[8], 0x42);
 +
 +    delete core;
 +}
 +
 diff --git a/src/cpu/valuepred/memory_renaming_core.hh b/src/cpu/valuepred/memory_renaming_core.hh
 new file mode 100644
-index 0000000000..fb72ba9d56
+index 0000000000..b87ed230fa
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_core.hh
-@@ -0,0 +1,522 @@
+@@ -0,0 +1,566 @@
 +#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 +#define __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 +
 +#include <algorithm>
++#include <cctype>
 +#include <cstdint>
 +#include <deque>
++#include <string>
 +#include <unordered_map>
 +#include <vector>
 +
@@ -1746,6 +2022,48 @@ index 0000000000..fb72ba9d56
 +    Addr pc = 0;
 +    InstSeqNum seqNum = 0;
 +};
++
++/** Result of decoding whether a memory uop targets the private stack. */
++struct StackAccessInfo
++{
++    bool isStackBase = false;
++    bool isPush = false;
++    bool isPop = false;
++    bool isPeek = false;
++};
++
++/**
++ * Classify stack-related memory operations from rename-stage metadata.
++ * rspIdx / rbpIdx are architecture-specific stack/frame pointer indices.
++ */
++inline StackAccessInfo
++classifyStackAccess(bool enableStatic, bool isLoad, bool isStore,
++                    int baseReg, int rspIdx, int rbpIdx,
++                    const std::string &macroMnemonic)
++{
++    StackAccessInfo info;
++    if (!enableStatic || (!isLoad && !isStore)) {
++        return info;
++    }
++    if (baseReg != rspIdx && baseReg != rbpIdx) {
++        return info;
++    }
++
++    info.isStackBase = true;
++    std::string mnem = macroMnemonic;
++    std::transform(mnem.begin(), mnem.end(), mnem.begin(),
++                   [](unsigned char c) { return std::tolower(c); });
++
++    if (isStore && (mnem == "push" || mnem == "call")) {
++        info.isPush = true;
++    } else if (isLoad && (mnem == "pop" || mnem == "ret")) {
++        info.isPop = true;
++    } else if (isLoad) {
++        info.isPeek = true;
++    }
++
++    return info;
++}
 +
 +template <typename RegIdType>
 +class MemoryRenamingCore

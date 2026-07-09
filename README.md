@@ -9,7 +9,7 @@ This repository provides an automated, end-to-end pipeline for performing microa
 * **`patches/`**: Diff files containing our custom C++ modifications to the upstream `ext/` submodules.
 * **`results/`**: Output data, containing trace summaries, generated configurations, and gem5 `stats.txt` runs.
 * **`scripts/`**: Automation scripts for executing the end-to-end pipeline.
-* **`tools/`**: Custom tools, particularly `trace_analyzer`, which is our DynamoRIO C++ client.
+* **`tools/`**: Custom tools and test programs. Notably `trace_analyzer`, which is our DynamoRIO C++ client.
 
 > [!NOTE]
 > **Synthetic (`-g`) vs. Real-World Datasets**
