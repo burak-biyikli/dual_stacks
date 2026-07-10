@@ -20,8 +20,12 @@ loop_start:
     cmp %rcx, %rax
     jne fail
 
+    #Check stack value
     popq %rax
+    cmp %rcx, %rax
+    jne fail
 
+    #Check loop count
     dec %rcx
     jnz loop_start
 

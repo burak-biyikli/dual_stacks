@@ -175,26 +175,37 @@ Microbenchmark catalog:
 
 Directory                         Purpose                         MR expectation
 ---------                         -------                         --------------
-forwarding_immediate_injection/   Stack store + delay + load       VPpredicted > 0
-                                  (Case A immediate injection)
-forwarding_delayed_copy/          add -> mov store (not ready)     VPpredicted > 0
-                                  -> load (Case B pending queue)
-forwarding_stack_peek/            push + mov (%rsp) peek           VPpredicted > 0
-                                  (static SRP path)
-forwarding_multiple_pending...    Two loads pending on one         VPpredicted > 0
-                                  not-ready store
-no_forwarding_dependency/         Alternating load-store PC        VPpredicted == 0
-                                  pairing prevents MRP confidence
-no_forwarding_size/               32-bit store + 64-bit load       VPpredicted == 0
-                                  size mismatch
-mispredict_changing_dependency/   Similar to the no forwarding     VPpredicted > 0
-                                  dependency test, but induces 
-                                  squashes intentionally
 app_lfsr_memory_pattern/          Four kernels at store-load       VPpredicted > 0
                                   distances 1/2/4/50
 app_rpn_calculator/               RPN stack calculator —           VPpredicted > 0
                                   repeated push/pop SRP + MRP
-
+forwarding_between_loop_iters/    Setsup forwarding to occur       VPpredicted > 0
+                                  between loads in the current iter
+                                  against stores in the current,
+                                  prior, and two iters prior
+forwarding_delayed_copy/          add -> mov store (not ready)     VPpredicted > 0
+                                  -> load (Case B pending queue)
+forwarding_immediate_injection/   Stack store + delay + load       VPpredicted > 0
+                                  (Case A immediate injection)
+forwarding_multiple_pending...    Two loads pending on one         VPpredicted > 0
+                                  not-ready store
+forwarding_stack_peek/            push + mov (%rsp) peek           VPpredicted > 0
+                                  (static SRP path)
+mispredict_changing_dependency/   Similar to the no forwarding     VPpredicted > 0
+                                  dependency test, but induces 
+                                  squashes intentionally
+mispredict_push_store_overlap/    Stack accesses are often safe to VPpredicted > 0
+                                  forward, and might be done with
+                                  no training. This tests failures
+                                  in that path.
+no_forwarding_demotion/           Tests a LD<-ST pair which is     VPpredicted == 0
+                                  broken up by regular stores. 
+                                  This should cause a demotion 
+                                  and freeze the entry
+no_forwarding_dependency/         Alternating load-store PC        VPpredicted == 0
+                                  pairing prevents MRP confidence
+no_forwarding_size/               32-bit store + 64-bit load       VPpredicted == 0
+                                  size mismatch
 
 ================================================================================
 ADDING A NEW MICROBENCHMARK
