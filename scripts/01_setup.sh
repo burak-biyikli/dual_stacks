@@ -55,6 +55,8 @@ scons build/X86/gem5.opt -j$(nproc) --linker=mold --ignore-style USE_CCACHE=1
 echo "=== 7. Fetching PARSEC Inputs ==="
 cd "$EXT_DIR/parsec-benchmark"
 ./get-inputs
+mkdir -p pkgs/apps/blackscholes/inputs/simsmall
+tar -xf pkgs/apps/blackscholes/inputs/input_simsmall.tar -C pkgs/apps/blackscholes/inputs/simsmall
 
 echo "=== 8. Building PARSEC ==="
 cd "$EXT_DIR/parsec-benchmark"

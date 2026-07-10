@@ -15,6 +15,7 @@ system.mem_ranges = [AddrRange("512MiB")]
 
 # Use O3 CPU
 system.cpu = X86O3CPU()
+system.cpu.mock_rdtsc = True
 
 # Attach Memory Renaming logic
 system.cpu.valuePred = MemoryRenaming()
@@ -33,8 +34,7 @@ system.cpu.valuePred = MemoryRenaming()
 # system.cpu.valuePred.enableDynamic = True
 # system.cpu.valuePred.enableStatic = True
 
-# Cap execution to prevent unbounded traces
-system.cpu.max_insts_any_thread = 100000
+
 
 system.membus = SystemXBar()
 system.cpu.icache_port = system.membus.cpu_side_ports
@@ -52,16 +52,24 @@ system.mem_ctrl.port = system.membus.mem_side_ports
 
 system.system_port = system.membus.cpu_side_ports
 
-# Take binary from arg
-if len(sys.argv) > 1:
-    binary = sys.argv[1]
-else:
+# Parse arguments
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--max-insts", type=int, default=100000, help="Max instructions")
+args, remainder = parser.parse_known_args()
+
+if not remainder:
     print("Error: No binary specified")
     sys.exit(1)
 
-system.workload = SEWorkload.init_compatible(binary)
+args.binary = remainder[0]
+args.benchmark_args = remainder[1:]
+
+system.cpu.max_insts_any_thread = args.max_insts
+
+system.workload = SEWorkload.init_compatible(args.binary)
 process = Process()
-process.cmd = [binary]
+process.cmd = [args.binary] + args.benchmark_args
 system.cpu.workload = process
 system.cpu.createThreads()
 

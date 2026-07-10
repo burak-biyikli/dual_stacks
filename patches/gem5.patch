@@ -1,3 +1,75 @@
+diff --git a/src/arch/x86/isa/microops/regop.isa b/src/arch/x86/isa/microops/regop.isa
+index b3efac1d02..cb9e9683af 100644
+--- a/src/arch/x86/isa/microops/regop.isa
++++ b/src/arch/x86/isa/microops/regop.isa
+@@ -1650,7 +1650,13 @@ let {{
+ 
+     class Rdtsc(RdRegOp):
+         code = '''
+-            DestReg = TscOp;
++            if (xc->tcBase()->getCpuPtr()->getMockRdtsc()) {
++                static uint64_t dummy_tsc = 0;
++                dummy_tsc += 100;
++                DestReg = dummy_tsc;
++            } else {
++                DestReg = TscOp;
++            }
+         '''
+ 
+     class Rdm5reg(RdRegOp):
+diff --git a/src/cpu/BaseCPU.py b/src/cpu/BaseCPU.py
+index 1358bd67bc..abd338c626 100644
+--- a/src/cpu/BaseCPU.py
++++ b/src/cpu/BaseCPU.py
+@@ -152,6 +152,11 @@ class BaseCPU(ClockedObject):
+         "between CPU models)",
+     )
+ 
++    mock_rdtsc = Param.Bool(
++        False,
++        "Mock the RDTSC instruction for deterministic timing in tests"
++    )
++
+     model_reset = ResetResponsePort("Generic reset for the CPU")
+ 
+     cpu_idle_pins = VectorIntSourcePin(
+diff --git a/src/cpu/base.cc b/src/cpu/base.cc
+index 944ae814cf..00fc4f6744 100644
+--- a/src/cpu/base.cc
++++ b/src/cpu/base.cc
+@@ -131,7 +131,7 @@ BaseCPU::BaseCPU(const Params &p, bool is_checker)
+       _instRequestorId(p.system->getRequestorId(this, "inst")),
+       _dataRequestorId(p.system->getRequestorId(this, "data")),
+       _taskId(context_switch_task_id::Unknown), _pid(invldPid),
+-      _switchedOut(p.switched_out), _cacheLineSize(p.system->cacheLineSize()),
++      _switchedOut(p.switched_out), _mockRdtsc(p.mock_rdtsc), _cacheLineSize(p.system->cacheLineSize()),
+       modelResetPort(p.name + ".model_reset"),
+       interrupts(p.interrupts), numThreads(p.numThreads), system(p.system),
+       previousCycle(0), previousState(CPU_STATE_SLEEP),
+diff --git a/src/cpu/base.hh b/src/cpu/base.hh
+index 229e49d221..f73972af5d 100644
+--- a/src/cpu/base.hh
++++ b/src/cpu/base.hh
+@@ -144,6 +144,9 @@ class BaseCPU : public ClockedObject
+     /** Is the CPU switched out or active? */
+     bool _switchedOut;
+ 
++    /** Mock the RDTSC instruction for deterministic timing in tests */
++    bool _mockRdtsc;
++
+     /** Cache the cache line size that we get from the system */
+     const Addr _cacheLineSize;
+ 
+@@ -396,6 +399,9 @@ class BaseCPU : public ClockedObject
+      */
+     bool switchedOut() const { return _switchedOut; }
+ 
++    /** Get whether we should mock the RDTSC instruction */
++    bool getMockRdtsc() const { return _mockRdtsc; }
++
+     /**
+      * Verify that the system is in a memory mode supported by the
+      * CPU.
 diff --git a/src/cpu/o3/BaseO3CPU.py b/src/cpu/o3/BaseO3CPU.py
 index 3c477c115b..8fe1e49a85 100644
 --- a/src/cpu/o3/BaseO3CPU.py
@@ -74,7 +146,7 @@ index 192f73da2e..8bce754d46 100644
  
  /** Struct that defines all backwards communication. */
 diff --git a/src/cpu/o3/commit.cc b/src/cpu/o3/commit.cc
-index 405ea09d64..31c0758c92 100644
+index 405ea09d64..1c391a977a 100644
 --- a/src/cpu/o3/commit.cc
 +++ b/src/cpu/o3/commit.cc
 @@ -63,6 +63,7 @@
@@ -95,15 +167,19 @@ index 405ea09d64..31c0758c92 100644
  {
      if (commitWidth > MaxWidth)
          fatal("commitWidth (%d) is larger than compiled limit (%d),\n"
-@@ -139,6 +141,7 @@ Commit::Commit(CPU *_cpu, const BaseO3CPUParams &params)
-         trapSquash[tid] = false;
-         tcSquash[tid] = false;
-         squashAfterInst[tid] = nullptr;
-+        valuePredictionSquash[tid] = false;
-         pc[tid].reset(params.isa[0]->newPCState());
-         youngestSeqNum[tid] = 0;
-         lastCommitedSeqNum[tid] = 0;
-@@ -1037,6 +1040,42 @@ Commit::commitInsts()
+@@ -794,6 +796,11 @@ Commit::commit()
+                     tid,
+                     fromIEW->mispredictInst[tid]->pcState().instAddr(),
+                     fromIEW->squashedSeqNum[tid]);
++            } else if (fromIEW->valuePredictionError[tid]) {
++                DPRINTF(Commit,
++                    "[tid:%i] Squashing due to value prediction error [sn:%llu]\n",
++                    tid, fromIEW->squashedSeqNum[tid]);
++                set(pc[tid], fromIEW->pc[tid]);
+             } else {
+                 DPRINTF(Commit,
+                     "[tid:%i] Squashing due to order violation [sn:%llu]\n",
+@@ -1037,6 +1044,38 @@ Commit::commitInsts()
                  // Keep track of the last sequence number commited
                  lastCommitedSeqNum[tid] = head_inst->seqNum;
  
@@ -139,29 +215,11 @@ index 405ea09d64..31c0758c92 100644
 +                    }
 +                }
 +
-+                if (head_inst->vpMisprediction) {
-+                    valuePredictionSquash[tid] = true;
-+                }
-+
                  // If this is an instruction that doesn't play nicely with
                  // others squash everything and restart fetch
                  if (head_inst->isSquashAfter())
-@@ -1060,6 +1099,13 @@ Commit::commitInsts()
-                                       !head_inst->isDelayedCommit();
- 
-                 if (onInstBoundary) {
-+                    if (valuePredictionSquash[tid]) {
-+                        DPRINTF(Commit, "[tid:%i] Squashing after value misprediction [sn:%llu]\n",
-+                                tid, head_inst->seqNum);
-+                        squashAfter(tid, head_inst);
-+                        valuePredictionSquash[tid] = false;
-+                    }
-+
-                     int count = 0;
-                     Addr oldpc;
-                     // Make sure we're not currently updating state while
 diff --git a/src/cpu/o3/commit.hh b/src/cpu/o3/commit.hh
-index 5f978c8c5d..16199f50b0 100644
+index 5f978c8c5d..febda9f3fc 100644
 --- a/src/cpu/o3/commit.hh
 +++ b/src/cpu/o3/commit.hh
 @@ -52,6 +52,7 @@
@@ -172,17 +230,7 @@ index 5f978c8c5d..16199f50b0 100644
  #include "cpu/timebuf.hh"
  #include "enums/CommitPolicy.hh"
  #include "sim/probe/probe.hh"
-@@ -374,6 +375,9 @@ class Commit
-      */
-     DynInstPtr squashAfterInst[MaxThreads];
- 
-+    /** Records if a thread has to squash due to a value prediction error. */
-+    bool valuePredictionSquash[MaxThreads];
-+
-     /** Priority List used for Commit Policy */
-     std::list<ThreadID> priority_list;
- 
-@@ -446,6 +450,8 @@ class Commit
+@@ -446,6 +447,8 @@ class Commit
      /** Rename map interface. */
      UnifiedRenameMap *renameMap[MaxThreads];
  
@@ -360,10 +408,18 @@ index f0c14fb177..df5a3042b5 100644
  
  } // namespace o3
 diff --git a/src/cpu/o3/iew.cc b/src/cpu/o3/iew.cc
-index d5be814468..b70b795429 100644
+index d5be814468..93c857a796 100644
 --- a/src/cpu/o3/iew.cc
 +++ b/src/cpu/o3/iew.cc
-@@ -88,7 +88,8 @@ IEW::IEW(CPU *_cpu, const BaseO3CPUParams &params)
+@@ -44,6 +44,7 @@
+ // communication happens simultaneously.
+ 
+ #include "cpu/o3/iew.hh"
++#include "cpu/valuepred/memory_renaming.hh"
+ 
+ #include <queue>
+ 
+@@ -88,7 +89,8 @@ IEW::IEW(CPU *_cpu, const BaseO3CPUParams &params)
        wbCycle(0),
        wbWidth(params.wbWidth),
        numThreads(params.numThreads),
@@ -373,7 +429,7 @@ index d5be814468..b70b795429 100644
  {
      if (dispatchWidth > MaxWidth)
          fatal("dispatchWidth (%d) is larger than compiled limit (%d),\n"
-@@ -297,6 +298,7 @@ IEW::clearStates(ThreadID tid)
+@@ -297,6 +299,7 @@ IEW::clearStates(ThreadID tid)
          iew_struct.branchMispredict[tid] = false;
          iew_struct.branchTaken[tid] = false;
          iew_struct.includeSquashInst[tid] = false;
@@ -381,7 +437,7 @@ index d5be814468..b70b795429 100644
      }
  
      // Clear out any of this thread's instructions being sent from
-@@ -519,6 +521,51 @@ IEW::squashDueToMemOrder(const DynInstPtr& inst, ThreadID tid)
+@@ -519,6 +522,53 @@ IEW::squashDueToMemOrder(const DynInstPtr& inst, ThreadID tid)
      }
  }
  
@@ -399,19 +455,21 @@ index d5be814468..b70b795429 100644
 +        toCommit->squashedSeqNum[tid] = inst->seqNum;
 +        set(toCommit->pc[tid], inst->pcState());
 +
-+        // advance pc to next instruction
-+        inst->staticInst->advancePC(*toCommit->pc[tid]);
-+
 +        toCommit->mispredictInst[tid] = nullptr;
 +
-+        // Even speculatively executed value prediction instructions cannot
-+        // be squashed after obtaining a correct result.
-+        toCommit->includeSquashInst[tid] = false;
++        // Squash the entire macro-op (re-execute the load)
++        toCommit->includeSquashInst[tid] = true;
 +
 +        wroteToTimeBuffer = true;
-+    }
 +
-+    toRename->iewBlock[tid] = true;
++        // Train early on value prediction squashes
++        if (cpu->valuePred) {
++            auto *mr = dynamic_cast<valuepred::MemoryRenaming*>(cpu->valuePred);
++            if (mr) {
++                mr->forceFreeze(inst->pcState().instAddr());
++            }
++        }
++    }
 +}
 +
 +void
@@ -433,7 +491,7 @@ index d5be814468..b70b795429 100644
  void
  IEW::block(ThreadID tid)
  {
-@@ -559,6 +606,12 @@ IEW::wakeDependents(const DynInstPtr& inst)
+@@ -559,6 +609,12 @@ IEW::wakeDependents(const DynInstPtr& inst)
      instQueue.wakeDependents(inst);
  }
  
@@ -446,7 +504,7 @@ index d5be814468..b70b795429 100644
  void
  IEW::rescheduleMemInst(const DynInstPtr& inst)
  {
-@@ -1014,6 +1067,10 @@ IEW::dispatchInsts(ThreadID tid)
+@@ -1014,6 +1070,10 @@ IEW::dispatchInsts(ThreadID tid)
              // memory access.
              ldstQueue.insertLoad(inst);
  
@@ -457,7 +515,7 @@ index d5be814468..b70b795429 100644
              ++iewStats.dispLoadInsts;
  
              add_to_iq = true;
-@@ -1337,6 +1394,9 @@ IEW::executeInsts()
+@@ -1337,6 +1397,9 @@ IEW::executeInsts()
                  squashDueToMemOrder(violator, tid);
  
                  ++iewStats.memOrderViolationEvents;
@@ -467,11 +525,11 @@ index d5be814468..b70b795429 100644
              }
          } else {
              // Reset any state associated with redirects that will not
-@@ -1414,6 +1474,10 @@ IEW::writebackInsts()
+@@ -1414,6 +1477,10 @@ IEW::writebackInsts()
                              inst->renamedDestIdx(i)->index(),
                              inst->renamedDestIdx(i)->className());
                      scoreboard->setReg(inst->renamedDestIdx(i));
-+                    if (valuePred && !inst->renamedDestIdx(i)->is(InvalidRegClass)) {
++                    if (valuePred && inst->renamedDestIdx(i)->is(IntRegClass)) {
 +                        RegVal val = cpu->getReg(inst->renamedDestIdx(i), inst->threadNumber);
 +                        valuePred->writebackReg(inst->renamedDestIdx(i), val);
 +                    }
@@ -595,7 +653,7 @@ index 844521caf9..b202ad965b 100644
      /** Adds a ready memory instruction to the ready list. */
      void addReadyMemInst(const DynInstPtr &ready_inst);
 diff --git a/src/cpu/o3/lsq_unit.cc b/src/cpu/o3/lsq_unit.cc
-index 67ae69237e..1a067c3759 100644
+index 67ae69237e..f0aed32700 100644
 --- a/src/cpu/o3/lsq_unit.cc
 +++ b/src/cpu/o3/lsq_unit.cc
 @@ -47,6 +47,7 @@
@@ -606,7 +664,7 @@ index 67ae69237e..1a067c3759 100644
  #include "debug/Activity.hh"
  #include "debug/HtmCpu.hh"
  #include "debug/IEW.hh"
-@@ -1114,6 +1115,26 @@ LSQUnit::writeback(const DynInstPtr &inst, PacketPtr pkt)
+@@ -1114,6 +1115,27 @@ LSQUnit::writeback(const DynInstPtr &inst, PacketPtr pkt)
          if (inst->fault == NoFault) {
              // Complete access to copy data to proper place.
              inst->completeAcc(pkt);
@@ -626,6 +684,7 @@ index 67ae69237e..1a067c3759 100644
 +                    if (inst->vpResult.speculative) {
 +                        if (real_val != inst->vpResult.value) {
 +                            inst->vpMisprediction = true;
++                            iewStage->squashDueToValuePrediction(inst, inst->threadNumber);
 +                        }
 +                    }
 +                }
@@ -633,7 +692,7 @@ index 67ae69237e..1a067c3759 100644
          } else {
              // If the instruction has an outstanding fault, we cannot complete
              // the access as this discards the current fault.
-@@ -1547,6 +1568,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
+@@ -1547,6 +1569,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
  
                  // Don't need to do anything special for split loads.
                  ++stats.forwLoads;
@@ -767,10 +826,10 @@ index 0000000000..25aa51554c
 +
 diff --git a/src/cpu/valuepred/ValuePredictor.py b/src/cpu/valuepred/ValuePredictor.py
 new file mode 100644
-index 0000000000..faa7b6f156
+index 0000000000..a16dbed741
 --- /dev/null
 +++ b/src/cpu/valuepred/ValuePredictor.py
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,36 @@
 +from m5.params import *
 +from m5.proxy import *
 +from m5.SimObject import *
@@ -801,6 +860,7 @@ index 0000000000..faa7b6f156
 +    reallocationConfidence = Param.Int(1, "starting confidence when a load changes its producer store PC")
 +    demotionPenalty = Param.Int(1, "Demotion penalty for wrong prediction or missing store")
 +    mrtQueueCapacity = Param.Int(8, "Capacity of each circular queue in the MRT")
++    mrtTableCapacity = Param.Int(1024, "Maximum number of Store PCs tracked in the MRT")
 +    committedStoreQueueCapacity = Param.Int(512, "Depth of the retired store FIFO (RS-FIFO) used for commit-time overlap detection")
 +
 +    # Path enables
@@ -808,10 +868,10 @@ index 0000000000..faa7b6f156
 +    enableStatic = Param.Bool(True, "Enable static Memory Renaming path (SRP)")
 diff --git a/src/cpu/valuepred/memory_renaming.cc b/src/cpu/valuepred/memory_renaming.cc
 new file mode 100644
-index 0000000000..09ea0902bd
+index 0000000000..039bb99f17
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.cc
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,285 @@
 +#include "cpu/valuepred/memory_renaming.hh"
 +
 +#include <algorithm>
@@ -835,7 +895,7 @@ index 0000000000..09ea0902bd
 +           params.allocationConfidence, params.reallocationConfidence,
 +           params.demotionPenalty, params.mrtQueueCapacity,
 +           params.committedStoreQueueCapacity, params.enableDynamic,
-+           params.enableStatic, params.numThreads)
++           params.enableStatic, params.mrtTableCapacity, params.numThreads)
 +{
 +    uint64_t maxThreshold = (1ULL << params.logMaxConfidence) - 1;
 +    fatal_if(params.predictionThreshold > maxThreshold,
@@ -1088,15 +1148,21 @@ index 0000000000..09ea0902bd
 +    }
 +}
 +
++void
++MemoryRenaming::forceFreeze(Addr loadPC)
++{
++    core.forceFreeze(loadPC);
++}
++
 +} // namespace valuepred
 +
 +} // namespace gem5
 diff --git a/src/cpu/valuepred/memory_renaming.hh b/src/cpu/valuepred/memory_renaming.hh
 new file mode 100644
-index 0000000000..b1f3bf477a
+index 0000000000..ba924818c5
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.hh
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,77 @@
 +#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_HH__
 +#define __CPU_VALUEPRED_MEMORY_RENAMING_HH__
 +
@@ -1165,6 +1231,8 @@ index 0000000000..b1f3bf477a
 +
 +    // LSQ completion hook
 +    void completeLoadLSU(const gem5::o3::DynInstPtr &inst);
++
++    void forceFreeze(Addr loadPC);
 +};
 +
 +} // namespace valuepred
@@ -1174,10 +1242,10 @@ index 0000000000..b1f3bf477a
 +#endif // __CPU_VALUEPRED_MEMORY_RENAMING_HH__
 diff --git a/src/cpu/valuepred/memory_renaming.test.cc b/src/cpu/valuepred/memory_renaming.test.cc
 new file mode 100644
-index 0000000000..b58b556e3b
+index 0000000000..3e69c3a938
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.test.cc
-@@ -0,0 +1,752 @@
+@@ -0,0 +1,756 @@
 +#include <gtest/gtest.h>
 +#include <random>
 +#include <vector>
@@ -1207,6 +1275,7 @@ index 0000000000..b58b556e3b
 +            512,    // committedStoreQueueCapacity
 +            true,   // enableDynamic
 +            true,   // enableStatic
++            1024,   // mrtTableCapacity
 +            1       // numThreads
 +        );
 +    }
@@ -1291,7 +1360,7 @@ index 0000000000..b58b556e3b
 +TEST_F(MemoryRenamingCoreTest, MRPReallocationConfidenceFreezesOnPCChange)
 +{
 +    auto core = new MemoryRenamingCore<int>(
-+        4, 1024, 16, 10, 2, 2, 1, 0, 1, 8, 512, true, true, 1);
++        4, 1024, 16, 10, 2, 2, 1, 0, 1, 8, 512, true, true, 1024, 1);
 +
 +    Addr loadPC = 0x1000;
 +    Addr storePC1 = 0x2000;
@@ -1341,6 +1410,7 @@ index 0000000000..b58b556e3b
 +        512,    // committedStoreQueueCapacity
 +        true,   // enableDynamic
 +        true,   // enableStatic
++        1024,   // mrtTableCapacity
 +        1       // numThreads
 +    );
 +
@@ -1414,6 +1484,7 @@ index 0000000000..b58b556e3b
 +        512,    // committedStoreQueueCapacity
 +        true,   // enableDynamic
 +        true,   // enableStatic
++        1024,   // mrtTableCapacity
 +        1       // numThreads
 +    );
 +
@@ -1504,6 +1575,7 @@ index 0000000000..b58b556e3b
 +        512,    // committedStoreQueueCapacity
 +        true,   // enableDynamic
 +        true,   // enableStatic
++        1024,   // mrtTableCapacity
 +        1       // numThreads
 +    );
 +
@@ -1802,7 +1874,7 @@ index 0000000000..b58b556e3b
 +TEST_F(MemoryRenamingCoreTest, RSFIFOCapacityEviction)
 +{
 +    auto core = new MemoryRenamingCore<int>(
-+        4, 1024, 16, 10, 2, 2, 1, 1, 1, 8, 3, true, true, 1);
++        4, 1024, 16, 10, 2, 2, 1, 1, 1, 8, 3, true, true, 1024, 1);
 +
 +    for (InstSeqNum sn = 1; sn <= 5; sn++) {
 +        core->commitStore(0x1000 + sn, sn, 0x5000 + sn, 8);
@@ -2156,10 +2228,10 @@ index 0000000000..3f83af734d
 +}
 diff --git a/src/cpu/valuepred/memory_renaming_core.hh b/src/cpu/valuepred/memory_renaming_core.hh
 new file mode 100644
-index 0000000000..18cbf95af5
+index 0000000000..aca938d802
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_core.hh
-@@ -0,0 +1,628 @@
+@@ -0,0 +1,733 @@
 +#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 +#define __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 +
@@ -2333,6 +2405,7 @@ index 0000000000..18cbf95af5
 +    const int reallocationConfidence;
 +    const int demotionPenalty;
 +    const int mrtQueueCapacity;
++    const int mrtTableCapacity;
 +    const int committedStoreQueueCapacity;
 +    const bool enableDynamic;
 +    const bool enableStatic;
@@ -2340,16 +2413,24 @@ index 0000000000..18cbf95af5
 +    // Storage tables
 +    std::vector<std::vector<MRPEntry>> mrpTable;
 +    std::unordered_map<Addr, MRTCircularQueue<RegIdType>> mrtTable;
++    std::deque<Addr> mrtKeysFIFO;
 +    std::deque<ActiveStore> activeStoreList;
 +    std::vector<std::deque<SRPEntry<RegIdType>>> srpStacks;
 +    std::deque<CommittedStore> committedStoreQueue;
++
++    struct PendingMRTUpdate
++    {
++        Addr storePC;
++        InstSeqNum seqNum;
++    };
++    std::unordered_multimap<RegIdType, PendingMRTUpdate> pendingPhysRegWrites;
 +
 +    MemoryRenamingCore(int _ways, int _entryCounts, int _tagWidth, int _logESTBEntrys,
 +                       int _logMaxConfidence, int _confidenceThreshold,
 +                       int _allocationConfidence, int _reallocationConfidence,
 +                       int _demotionPenalty, int _mrtQueueCapacity,
 +                       int _committedStoreQueueCapacity, bool _enableDynamic,
-+                       bool _enableStatic, int numThreads)
++                       bool _enableStatic, int _mrtTableCapacity, int numThreads)
 +        : ways(_ways), entryCounts(_entryCounts), tagWidth(_tagWidth), logESTBEntrys(_logESTBEntrys),
 +          logMaxConfidence(_logMaxConfidence), MAXCONFIDENCE((1 << _logMaxConfidence) - 1),
 +          confidenceThreshold(_confidenceThreshold),
@@ -2357,6 +2438,7 @@ index 0000000000..18cbf95af5
 +          reallocationConfidence(_reallocationConfidence),
 +          demotionPenalty(_demotionPenalty),
 +          mrtQueueCapacity(_mrtQueueCapacity),
++          mrtTableCapacity(_mrtTableCapacity),
 +          committedStoreQueueCapacity(_committedStoreQueueCapacity),
 +          enableDynamic(_enableDynamic), enableStatic(_enableStatic)
 +    {
@@ -2582,7 +2664,23 @@ index 0000000000..18cbf95af5
 +                RegIdType st_physreg, bool stPhysRegReady, Addr regVal)
 +    {
 +        if (mrtTable.find(storePC) == mrtTable.end()) {
++            if ((int)mrtTable.size() >= mrtTableCapacity) {
++                // Evict the oldest key (FIFO)
++                Addr oldestPC = mrtKeysFIFO.front();
++                mrtKeysFIFO.pop_front();
++                mrtTable.erase(oldestPC);
++
++                // Clean up any pending writes associated with the evicted PC
++                for (auto it = pendingPhysRegWrites.begin(); it != pendingPhysRegWrites.end(); ) {
++                    if (it->second.storePC == oldestPC) {
++                        it = pendingPhysRegWrites.erase(it);
++                    } else {
++                        ++it;
++                    }
++                }
++            }
 +            mrtTable.emplace(storePC, MRTCircularQueue<RegIdType>(mrtQueueCapacity));
++            mrtKeysFIFO.push_back(storePC);
 +        }
 +        auto &q = mrtTable[storePC];
 +
@@ -2595,6 +2693,13 @@ index 0000000000..18cbf95af5
 +        entry.size = size;
 +
 +        q.push(entry);
++
++        if (!stPhysRegReady) {
++            PendingMRTUpdate update;
++            update.storePC = storePC;
++            update.seqNum = seqNum;
++            pendingPhysRegWrites.emplace(st_physreg, update);
++        }
 +
 +        ActiveStore activeStore;
 +        activeStore.pc = storePC;
@@ -2723,22 +2828,41 @@ index 0000000000..18cbf95af5
 +    void
 +    updateMRTData(RegIdType physReg, Addr val)
 +    {
-+        for (auto &mrtPair : mrtTable) {
-+            auto &q = mrtPair.second;
-+            for (int i = 0; i < q.count; i++) {
-+                MRTEntry<RegIdType> *entry = q.getAtOffset(i);
-+                if (entry && entry->valid && entry->st_physreg == physReg &&
-+                    !entry->dataReady) {
-+                    entry->data = val;
-+                    entry->dataReady = true;
++        auto range = pendingPhysRegWrites.equal_range(physReg);
++        for (auto it = range.first; it != range.second; ) {
++            Addr storePC = it->second.storePC;
++            InstSeqNum seqNum = it->second.seqNum;
++
++            auto mrtIt = mrtTable.find(storePC);
++            if (mrtIt != mrtTable.end()) {
++                auto &q = mrtIt->second;
++                for (int i = 0; i < q.count; i++) {
++                    MRTEntry<RegIdType> *entry = q.getAtOffset(i);
++                    if (entry && entry->valid && entry->seqNum == seqNum) {
++                        if (!entry->dataReady) {
++                            entry->data = val;
++                            entry->dataReady = true;
++                        }
++                        break;
++                    }
 +                }
 +            }
++            it = pendingPhysRegWrites.erase(it);
 +        }
 +    }
 +
 +    void
 +    squash(ThreadID tid, uint64_t seq_no)
 +    {
++        // Clean up pendingPhysRegWrites for squashed entries
++        for (auto it = pendingPhysRegWrites.begin(); it != pendingPhysRegWrites.end(); ) {
++            if (it->second.seqNum > seq_no) {
++                it = pendingPhysRegWrites.erase(it);
++            } else {
++                ++it;
++            }
++        }
++
 +        // Invalidate and roll back squashed stores in every MRT queue.
 +        for (auto &mrtPair : mrtTable) {
 +            auto &q = mrtPair.second;
@@ -2779,6 +2903,59 @@ index 0000000000..18cbf95af5
 +                entry.popped = false;
 +                entry.poppedSeqNum = 0;
 +            }
++        }
++    }
++
++    void
++    forceFreeze(Addr loadPC)
++    {
++        std::vector<uint32_t> indexEachWays(ways);
++        std::vector<uint32_t> tagEachWays(ways);
++        for (int i = 0; i < ways; i++) {
++            indexEachWays[i] = pcHashToWayIndex(loadPC, i);
++            tagEachWays[i] = pcHashToTag(loadPC, i);
++        }
++
++        int hitWay = -1;
++        for (int i = 0; i < ways; i++) {
++            auto &mrpEntry = mrpTable[i][indexEachWays[i]];
++            if (mrpEntry.valid && !compareTags(mrpEntry.tag, tagEachWays[i])) {
++                hitWay = i;
++                break;
++            }
++        }
++
++        if (hitWay >= 0) {
++            auto &mrpEntry = mrpTable[hitWay][indexEachWays[hitWay]];
++            mrpEntry.confidence = 0;
++            mrpEntry.frozen = true;
++            mrpEntry.rrip = 3;
++        } else {
++            // Allocate a new frozen entry using RRIP replacement
++            int victimWay = -1;
++            while (victimWay < 0) {
++                for (int i = 0; i < ways; i++) {
++                    auto &mrpEntry = mrpTable[i][indexEachWays[i]];
++                    if (!mrpEntry.valid || mrpEntry.rrip == 3) {
++                        victimWay = i;
++                        break;
++                    }
++                }
++                if (victimWay < 0) {
++                    for (int i = 0; i < ways; i++) {
++                        mrpTable[i][indexEachWays[i]].rrip++;
++                    }
++                }
++            }
++
++            auto &victim = mrpTable[victimWay][indexEachWays[victimWay]];
++            victim.valid = true;
++            victim.frozen = true;
++            victim.tag = tagEachWays[victimWay];
++            victim.storePC = 0;
++            victim.offset = 0;
++            victim.confidence = 0;
++            victim.rrip = 3; // Evictable
 +        }
 +    }
 +};

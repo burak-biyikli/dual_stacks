@@ -1,8 +1,8 @@
 diff --git a/.gitignore b/.gitignore
-index d7b36c15..f38b6ba9 100644
+index d7b36c15..46ae37f3 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -23,3 +23,9 @@ run
+@@ -23,3 +23,12 @@ run
  /bin/.#parsecmgmt.1.6
  /toolkit/hpt/loggroup1.old/
  /toolkit/hpt/loggroup2.old/
@@ -11,4 +11,7 @@ index d7b36c15..f38b6ba9 100644
 +/build_*.log
 +/err_test.txt
 +/out_test.txt
++
++# PARSEC inputs extracted during setup
++/pkgs/apps/blackscholes/inputs/simsmall/in_4K.txt
 +
