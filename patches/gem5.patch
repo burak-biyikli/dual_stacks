@@ -192,7 +192,7 @@ index 5f978c8c5d..16199f50b0 100644
      bool canHandleInterrupts;
  
 diff --git a/src/cpu/o3/cpu.cc b/src/cpu/o3/cpu.cc
-index ad539e7948..d7cc4998f1 100644
+index ad539e7948..1f2218e3d0 100644
 --- a/src/cpu/o3/cpu.cc
 +++ b/src/cpu/o3/cpu.cc
 @@ -61,6 +61,7 @@
@@ -221,7 +221,26 @@ index ad539e7948..d7cc4998f1 100644
      fatal_if(FullSystem && params.numThreads > 1,
              "SMT is not supported in O3 in full system mode currently.");
  
-@@ -1503,5 +1512,33 @@ CPU::htmSendAbortSignal(ThreadID tid, uint64_t htm_uid,
+@@ -1325,13 +1334,16 @@ CPU::dumpInsts()
+         ++num;
+     }
+ }
+-/*
+ void
+ CPU::wakeDependents(const DynInstPtr &inst)
+ {
+     iew.wakeDependents(inst);
+ }
+-*/
++void
++CPU::wakeRegisterDependents(PhysRegIdPtr dest_reg)
++{
++    iew.wakeRegisterDependents(dest_reg);
++}
+ void
+ CPU::wakeCPU()
+ {
+@@ -1503,5 +1515,33 @@ CPU::htmSendAbortSignal(ThreadID tid, uint64_t htm_uid,
      }
  }
  
@@ -256,7 +275,7 @@ index ad539e7948..d7cc4998f1 100644
  } // namespace o3
  } // namespace gem5
 diff --git a/src/cpu/o3/cpu.hh b/src/cpu/o3/cpu.hh
-index faa31d6c1c..5231b711c2 100644
+index faa31d6c1c..c534880d4f 100644
 --- a/src/cpu/o3/cpu.hh
 +++ b/src/cpu/o3/cpu.hh
 @@ -68,6 +68,7 @@
@@ -267,7 +286,16 @@ index faa31d6c1c..5231b711c2 100644
  #include "cpu/simple_thread.hh"
  #include "cpu/timebuf.hh"
  #include "params/BaseO3CPU.hh"
-@@ -384,6 +385,10 @@ class CPU : public BaseCPU
+@@ -329,6 +330,8 @@ class CPU : public BaseCPU
+ 
+     void setReg(PhysRegIdPtr phys_reg, RegVal val, ThreadID tid);
+     void setReg(PhysRegIdPtr phys_reg, const void *val, ThreadID tid);
++    void wakeDependents(const DynInstPtr &inst);
++    void wakeRegisterDependents(PhysRegIdPtr dest_reg);
+ 
+     /** Architectural register accessors.  Looks up in the commit
+      * rename table to obtain the true physical index of the
+@@ -384,6 +387,10 @@ class CPU : public BaseCPU
      /** Debug function to print all instructions on the list. */
      void dumpInsts();
  
@@ -278,7 +306,7 @@ index faa31d6c1c..5231b711c2 100644
    public:
  #ifndef NDEBUG
      /** Count of total number of dynamic instructions in flight. */
-@@ -463,6 +468,7 @@ class CPU : public BaseCPU
+@@ -463,6 +470,7 @@ class CPU : public BaseCPU
      std::vector<BaseISA *> isa;
  
    public:
@@ -287,7 +315,7 @@ index faa31d6c1c..5231b711c2 100644
       *  activateStage() or deactivateStage(), they can specify which stage
       *  is being activated/deactivated.
 diff --git a/src/cpu/o3/dyn_inst.hh b/src/cpu/o3/dyn_inst.hh
-index f0c14fb177..d2474e4868 100644
+index f0c14fb177..df5a3042b5 100644
 --- a/src/cpu/o3/dyn_inst.hh
 +++ b/src/cpu/o3/dyn_inst.hh
 @@ -58,6 +58,7 @@
@@ -317,7 +345,7 @@ index f0c14fb177..d2474e4868 100644
 +    void setProducerStoreSeqNum(InstSeqNum seqNum) { _producerStoreSeqNum = seqNum; }
 +    InstSeqNum producerStoreSeqNum() const { return _producerStoreSeqNum; }
 +
-+    valuepred::VPResult vpResult = {false, 0xdeadbeefULL};
++    valuepred::VPResult vpResult = {false, 0xdeadbeefULL, false};
 +    std::unique_ptr<valuepred::VPPredictionRecord> vpRecord = nullptr;
 +    bool vpApplied = false;
 +
@@ -332,7 +360,7 @@ index f0c14fb177..d2474e4868 100644
  
  } // namespace o3
 diff --git a/src/cpu/o3/iew.cc b/src/cpu/o3/iew.cc
-index d5be814468..57252b260e 100644
+index d5be814468..b70b795429 100644
 --- a/src/cpu/o3/iew.cc
 +++ b/src/cpu/o3/iew.cc
 @@ -88,7 +88,8 @@ IEW::IEW(CPU *_cpu, const BaseO3CPUParams &params)
@@ -405,18 +433,31 @@ index d5be814468..57252b260e 100644
  void
  IEW::block(ThreadID tid)
  {
-@@ -1014,6 +1061,10 @@ IEW::dispatchInsts(ThreadID tid)
+@@ -559,6 +606,12 @@ IEW::wakeDependents(const DynInstPtr& inst)
+     instQueue.wakeDependents(inst);
+ }
+ 
++void
++IEW::wakeRegisterDependents(PhysRegIdPtr dest_reg)
++{
++    instQueue.wakeRegisterDependents(dest_reg);
++}
++
+ void
+ IEW::rescheduleMemInst(const DynInstPtr& inst)
+ {
+@@ -1014,6 +1067,10 @@ IEW::dispatchInsts(ThreadID tid)
              // memory access.
              ldstQueue.insertLoad(inst);
  
-+            if (valuePred && inst->vpSupported && inst->vpResult.speculative) {
++            if (valuePred && inst->vpSupported && inst->vpResult.speculative && inst->vpResult.dataReady) {
 +                lvpWakeDependents(inst);
 +            }
 +
              ++iewStats.dispLoadInsts;
  
              add_to_iq = true;
-@@ -1337,6 +1388,9 @@ IEW::executeInsts()
+@@ -1337,6 +1394,9 @@ IEW::executeInsts()
                  squashDueToMemOrder(violator, tid);
  
                  ++iewStats.memOrderViolationEvents;
@@ -426,7 +467,7 @@ index d5be814468..57252b260e 100644
              }
          } else {
              // Reset any state associated with redirects that will not
-@@ -1414,6 +1468,10 @@ IEW::writebackInsts()
+@@ -1414,6 +1474,10 @@ IEW::writebackInsts()
                              inst->renamedDestIdx(i)->index(),
                              inst->renamedDestIdx(i)->className());
                      scoreboard->setReg(inst->renamedDestIdx(i));
@@ -438,7 +479,7 @@ index d5be814468..57252b260e 100644
              }
  
 diff --git a/src/cpu/o3/iew.hh b/src/cpu/o3/iew.hh
-index c62a3dc835..e5bfdd0868 100644
+index c62a3dc835..a552548f07 100644
 --- a/src/cpu/o3/iew.hh
 +++ b/src/cpu/o3/iew.hh
 @@ -51,6 +51,7 @@
@@ -458,7 +499,15 @@ index c62a3dc835..e5bfdd0868 100644
      /** Sets main time buffer used for backwards communication. */
      void setTimeBuffer(TimeBuffer<TimeStruct> *tb_ptr);
  
-@@ -250,6 +253,7 @@ class IEW
+@@ -171,6 +174,7 @@ class IEW
+ 
+     /** Wakes all dependents of a completed instruction. */
+     void wakeDependents(const DynInstPtr &inst);
++    void wakeRegisterDependents(PhysRegIdPtr dest_reg);
+ 
+     /** Tells memory dependence unit that a memory instruction needs to be
+      * rescheduled. It will re-execute once replayMemInst() is called.
+@@ -250,6 +254,7 @@ class IEW
       * violation.
       */
      void squashDueToMemOrder(const DynInstPtr &inst, ThreadID tid);
@@ -466,7 +515,7 @@ index c62a3dc835..e5bfdd0868 100644
  
      /** Sets Dispatch to blocked, and signals back to other stages to block. */
      void block(ThreadID tid);
-@@ -342,6 +346,8 @@ class IEW
+@@ -342,6 +347,8 @@ class IEW
      /** Scoreboard pointer. */
      Scoreboard* scoreboard;
  
@@ -475,6 +524,76 @@ index c62a3dc835..e5bfdd0868 100644
    private:
      /** CPU pointer. */
      CPU *cpu;
+diff --git a/src/cpu/o3/inst_queue.cc b/src/cpu/o3/inst_queue.cc
+index dd26eca82f..3c4cc9423b 100644
+--- a/src/cpu/o3/inst_queue.cc
++++ b/src/cpu/o3/inst_queue.cc
+@@ -1170,6 +1170,34 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst)
+     return dependents;
+ }
+ 
++void
++InstructionQueue::wakeRegisterDependents(PhysRegIdPtr dest_reg)
++{
++    if (dest_reg->isAlwaysReady()) {
++        return;
++    }
++
++    dest_reg->decrNumPinnedWritesToComplete();
++    if (dest_reg->getNumPinnedWritesToComplete() != 0) {
++        return;
++    }
++
++    DPRINTF(IQ, "Waking any dependents on register %i (%s) via value prediction.\n",
++            dest_reg->index(), dest_reg->className());
++
++    DynInstPtr dep_inst = dependGraph.pop(dest_reg->flatIndex());
++    while (dep_inst) {
++        DPRINTF(IQ, "Waking up a dependent instruction, [sn:%llu] PC %s.\n",
++                dep_inst->seqNum, dep_inst->pcState());
++        dep_inst->markSrcRegReady();
++        addIfReady(dep_inst);
++        dep_inst = dependGraph.pop(dest_reg->flatIndex());
++    }
++    assert(dependGraph.empty(dest_reg->flatIndex()));
++    dependGraph.clearInst(dest_reg->flatIndex());
++    regScoreboard[dest_reg->flatIndex()] = true;
++}
++
+ void
+ InstructionQueue::addReadyMemInst(const DynInstPtr &ready_inst)
+ {
+@@ -1528,7 +1556,9 @@ InstructionQueue::addToProducers(const DynInstPtr &new_inst)
+         dependGraph.setInst(dest_reg->flatIndex(), new_inst);
+ 
+         // Mark the scoreboard to say it's not yet ready.
+-        regScoreboard[dest_reg->flatIndex()] = false;
++        if (!(new_inst->vpResult.speculative && new_inst->vpResult.dataReady)) {
++            regScoreboard[dest_reg->flatIndex()] = false;
++        }
+     }
+ }
+ 
+diff --git a/src/cpu/o3/inst_queue.hh b/src/cpu/o3/inst_queue.hh
+index 844521caf9..b202ad965b 100644
+--- a/src/cpu/o3/inst_queue.hh
++++ b/src/cpu/o3/inst_queue.hh
+@@ -50,6 +50,7 @@
+ #include "base/statistics.hh"
+ #include "base/types.hh"
+ #include "cpu/inst_seq.hh"
++#include "cpu/reg_class.hh"
+ #include "cpu/o3/comm.hh"
+ #include "cpu/o3/dep_graph.hh"
+ #include "cpu/o3/dyn_inst_ptr.hh"
+@@ -330,6 +331,7 @@ class InstructionQueue
+ 
+     /** Wakes all dependents of a completed instruction. */
+     int wakeDependents(const DynInstPtr &completed_inst);
++    void wakeRegisterDependents(PhysRegIdPtr dest_reg);
+ 
+     /** Adds a ready memory instruction to the ready list. */
+     void addReadyMemInst(const DynInstPtr &ready_inst);
 diff --git a/src/cpu/o3/lsq_unit.cc b/src/cpu/o3/lsq_unit.cc
 index 67ae69237e..1a067c3759 100644
 --- a/src/cpu/o3/lsq_unit.cc
@@ -689,10 +808,10 @@ index 0000000000..faa7b6f156
 +    enableStatic = Param.Bool(True, "Enable static Memory Renaming path (SRP)")
 diff --git a/src/cpu/valuepred/memory_renaming.cc b/src/cpu/valuepred/memory_renaming.cc
 new file mode 100644
-index 0000000000..1f93afcf54
+index 0000000000..09ea0902bd
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.cc
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,279 @@
 +#include "cpu/valuepred/memory_renaming.hh"
 +
 +#include <algorithm>
@@ -835,16 +954,20 @@ index 0000000000..1f93afcf54
 +        stats.VPpredicted++;
 +        if (dataReady) {
 +            inst->vpResult.value = predictedVal;
++            inst->vpResult.dataReady = true;
 +            if (cpu && ld_physreg && !ld_physreg->is(InvalidRegClass)) {
 +                cpu->setReg(ld_physreg, predictedVal, tid);
 +                cpu->getScoreboard()->setReg(ld_physreg);
 +            }
-+            DPRINTF(MemoryRenaming, "Rename LD [sn:%lu] PC %lx Match: data %lx injected into %s\n",
-+                    inst->seqNum, loadPC, predictedVal, ld_physreg ? ld_physreg->className() : "null");
++            DPRINTF(MemoryRenaming, "Rename LD [sn:%lu] PC %lx Match: data %lx injected into %s (flat:%d)\n",
++                    inst->seqNum, loadPC, predictedVal, ld_physreg ? ld_physreg->className() : "null",
++                    ld_physreg ? ld_physreg->flatIndex() : -1);
 +        } else {
++            inst->vpResult.dataReady = false;
 +            pendingLoads[stPhysReg->flatIndex()].push_back(inst);
-+            DPRINTF(MemoryRenaming, "Rename LD [sn:%lu] PC %lx Match: Pending on st_physreg %s\n",
-+                    inst->seqNum, loadPC, stPhysReg ? stPhysReg->className() : "null");
++            DPRINTF(MemoryRenaming, "Rename LD [sn:%lu] PC %lx Match: Pending on st_physreg %s (flat:%d)\n",
++                    inst->seqNum, loadPC, stPhysReg ? stPhysReg->className() : "null",
++                    stPhysReg ? stPhysReg->flatIndex() : -1);
 +        }
 +    }
 +}
@@ -934,9 +1057,12 @@ index 0000000000..1f93afcf54
 +                if (cpu && ld_physreg && !ld_physreg->is(InvalidRegClass)) {
 +                    cpu->setReg(ld_physreg, val, loadInst->threadNumber);
 +                    cpu->getScoreboard()->setReg(ld_physreg);
++                    loadInst->vpResult.dataReady = true;
++                    cpu->wakeRegisterDependents(ld_physreg);
 +                }
-+                DPRINTF(MemoryRenaming, "Pending Writeback: injected st_physreg %s val %lx into LD [sn:%lu] ld_physreg %s\n",
-+                        physReg->className(), val, loadInst->seqNum, ld_physreg ? ld_physreg->className() : "null");
++                DPRINTF(MemoryRenaming, "Pending Writeback: injected st_physreg %s (flat:%d) val %lx into LD [sn:%lu] ld_physreg %s (flat:%d)\n",
++                        physReg->className(), physReg->flatIndex(), val, loadInst->seqNum,
++                        ld_physreg ? ld_physreg->className() : "null", ld_physreg ? ld_physreg->flatIndex() : -1);
 +            }
 +        }
 +        pendingLoads.erase(it);
@@ -1048,10 +1174,10 @@ index 0000000000..b1f3bf477a
 +#endif // __CPU_VALUEPRED_MEMORY_RENAMING_HH__
 diff --git a/src/cpu/valuepred/memory_renaming.test.cc b/src/cpu/valuepred/memory_renaming.test.cc
 new file mode 100644
-index 0000000000..ba9fa89c8a
+index 0000000000..b58b556e3b
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.test.cc
-@@ -0,0 +1,716 @@
+@@ -0,0 +1,752 @@
 +#include <gtest/gtest.h>
 +#include <random>
 +#include <vector>
@@ -1768,6 +1894,42 @@ index 0000000000..ba9fa89c8a
 +    delete core;
 +}
 +
++TEST_F(MemoryRenamingCoreTest, SquashRemovesGhostStoreAfterMispredict)
++{
++    auto core = createDefaultCore();
++    ThreadID tid = 0;
++    Addr pushPC = 0x400183;
++    Addr storePC = 0x400199;
++    Addr popPC = 0x40019d;
++
++    // pushq %rcx
++    core->pushSRP(tid, pushPC, 10, 8, -8, 100);
++    core->insertStore(pushPC, 10, tid, 8, 100, true, 0x20);
++
++    // Speculative movq %r8, (%rsp) on the wrong path
++    core->pushSRP(tid, storePC, 25, 8, 0, 200);
++    core->insertStore(storePC, 25, tid, 8, 200, false, 0);
++
++    // Branch resolves taken: squash younger than the branch at seq 20
++    core->squash(tid, 20);
++
++    EXPECT_EQ(core->srpStacks[tid].size(), 1U);
++    EXPECT_EQ(core->srpStacks[tid][0].seqNum, 10);
++    EXPECT_EQ(core->mrtTable[storePC].count, 0);
++
++    bool spec = false, ready = false;
++    Addr data = 0;
++    int stReg = 0;
++    bool hit = core->matchLoad(popPC, 8, tid, 30, true, false, 0,
++                               spec, data, stReg, ready);
++    EXPECT_TRUE(hit);
++    EXPECT_EQ(stReg, 100);
++    EXPECT_EQ(data, 0x20U);
++    EXPECT_TRUE(ready);
++
++    delete core;
++}
++
 diff --git a/src/cpu/valuepred/memory_renaming_commit_pipeline.test.cc b/src/cpu/valuepred/memory_renaming_commit_pipeline.test.cc
 new file mode 100644
 index 0000000000..3f83af734d
@@ -1994,10 +2156,10 @@ index 0000000000..3f83af734d
 +}
 diff --git a/src/cpu/valuepred/memory_renaming_core.hh b/src/cpu/valuepred/memory_renaming_core.hh
 new file mode 100644
-index 0000000000..a2d6b4921d
+index 0000000000..18cbf95af5
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_core.hh
-@@ -0,0 +1,622 @@
+@@ -0,0 +1,628 @@
 +#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 +#define __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 +
@@ -2541,7 +2703,8 @@ index 0000000000..a2d6b4921d
 +                        if (mrtIt != mrtTable.end()) {
 +                            auto &q = mrtIt->second;
 +                            MRTEntry<RegIdType>* storeEntry = q.getAtOffset(offset);
-+                            if (storeEntry && storeEntry->size == loadSize && storeEntry->seqNum < seqNum) {
++                            if (storeEntry && storeEntry->valid &&
++                                storeEntry->size == loadSize && storeEntry->seqNum < seqNum) {
 +                                outSpeculative = true;
 +                                outData = storeEntry->data;
 +                                outStPhysReg = storeEntry->st_physreg;
@@ -2564,7 +2727,8 @@ index 0000000000..a2d6b4921d
 +            auto &q = mrtPair.second;
 +            for (int i = 0; i < q.count; i++) {
 +                MRTEntry<RegIdType> *entry = q.getAtOffset(i);
-+                if (entry && entry->st_physreg == physReg && !entry->dataReady) {
++                if (entry && entry->valid && entry->st_physreg == physReg &&
++                    !entry->dataReady) {
 +                    entry->data = val;
 +                    entry->dataReady = true;
 +                }
@@ -2575,37 +2739,41 @@ index 0000000000..a2d6b4921d
 +    void
 +    squash(ThreadID tid, uint64_t seq_no)
 +    {
-+        // Rollback active stores in MRT
-+        int numSquashedStores = 0;
-+        for (int i = (int)activeStoreList.size() - 1; i >= 0; i--) {
-+            if (activeStoreList[i].tid == tid && activeStoreList[i].seqNum > seq_no) {
-+                numSquashedStores++;
-+                Addr storePC = activeStoreList[i].pc;
-+                auto mrtIt = mrtTable.find(storePC);
-+                if (mrtIt != mrtTable.end()) {
-+                    mrtIt->second.rollback(1);
++        // Invalidate and roll back squashed stores in every MRT queue.
++        for (auto &mrtPair : mrtTable) {
++            auto &q = mrtPair.second;
++            for (int i = 0; i < q.count; i++) {
++                MRTEntry<RegIdType> *entry = q.getAtOffset(i);
++                if (entry && entry->valid && entry->seqNum > seq_no) {
++                    entry->valid = false;
++                }
++            }
++            while (q.count > 0) {
++                MRTEntry<RegIdType> *tail = q.getAtOffset(0);
++                if (tail && tail->seqNum > seq_no) {
++                    q.rollback(1);
++                } else {
++                    break;
 +                }
 +            }
 +        }
-+        if (numSquashedStores > 0) {
-+            activeStoreList.erase(activeStoreList.end() - numSquashedStores, activeStoreList.end());
-+        }
 +
-+        // Truncate SRP-stack pushes
++        activeStoreList.erase(
++            std::remove_if(activeStoreList.begin(), activeStoreList.end(),
++                           [tid, seq_no](const ActiveStore &store) {
++                               return store.tid == tid && store.seqNum > seq_no;
++                           }),
++            activeStoreList.end());
++
 +        auto &stack = srpStacks[tid];
-+        int numSquashedPushes = 0;
-+        for (int i = (int)stack.size() - 1; i >= 0; i--) {
-+            if (stack[i].seqNum > seq_no) {
-+                numSquashedPushes++;
-+            } else {
-+                break;
-+            }
-+        }
-+        if (numSquashedPushes > 0) {
-+            stack.erase(stack.end() - numSquashedPushes, stack.end());
-+        }
++        stack.erase(
++            std::remove_if(stack.begin(), stack.end(),
++                           [seq_no](const SRPEntry<RegIdType> &entry) {
++                               return entry.seqNum > seq_no;
++                           }),
++            stack.end());
 +
-+        // Restore popped state on SRP-stack pops
++        // Restore popped state on SRP-stack pops squashed after the producer.
 +        for (auto &entry : stack) {
 +            if (entry.popped && entry.poppedSeqNum > seq_no) {
 +                entry.popped = false;
@@ -3136,10 +3304,10 @@ index 0000000000..40e43c9344
 +}
 diff --git a/src/cpu/valuepred/valuepred_metadata.hh b/src/cpu/valuepred/valuepred_metadata.hh
 new file mode 100644
-index 0000000000..1c80f8cf9a
+index 0000000000..69f93dd116
 --- /dev/null
 +++ b/src/cpu/valuepred/valuepred_metadata.hh
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,209 @@
 +#ifndef __VALUEPRED_METADATA_HH_
 +#define __VALUEPRED_METADATA_HH_
 +
@@ -3322,6 +3490,8 @@ index 0000000000..1c80f8cf9a
 +    bool speculative = false;
 +    // prediction value
 +    RegVal value = 0;
++    // is the predicted value ready to be consumed?
++    bool dataReady = false;
 +};
 +
 +class VPPredictionCandidate
