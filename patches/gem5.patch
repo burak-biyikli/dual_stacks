@@ -786,7 +786,7 @@ index f17212990d..7ef2817807 100644
       * and ROB, but are not yet included in their occupancy counts.
       */
 diff --git a/src/cpu/timebuf.hh b/src/cpu/timebuf.hh
-index 9810286c05..1d2713e0f3 100644
+index 9810286c05..9d8f02b284 100644
 --- a/src/cpu/timebuf.hh
 +++ b/src/cpu/timebuf.hh
 @@ -146,7 +146,7 @@ class TimeBuffer
@@ -798,6 +798,15 @@ index 9810286c05..1d2713e0f3 100644
              ptr += sizeof(T);
          }
  
+@@ -186,7 +186,7 @@ class TimeBuffer
+             ptr -= size;
+         (reinterpret_cast<T *>(index[ptr]))->~T();
+         std::memset(index[ptr], 0, sizeof(T));
+-        new (index[ptr]) T;
++        new (index[ptr]) T();
+     }
+ 
+   protected:
 diff --git a/src/cpu/valuepred/SConscript b/src/cpu/valuepred/SConscript
 new file mode 100644
 index 0000000000..25aa51554c
