@@ -281,7 +281,11 @@ def apply_patches_and_build() -> None:
 
 def write_manifests(output_dir: Path, manifest: dict[str, Any]) -> None:
     (output_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    fields = ["profile", "profile_status", "label", "mr_mode", "physreg", "lq_entries", "sq_entries", "load_ports", "store_ports", "status", "returncode", "error", "outdir", "command"]
+    fields = [
+        "profile", "profile_status", "label", "mr_mode", "physreg", "lq_entries",
+        "sq_entries", "load_ports", "store_ports", "non_sweep_run", "status",
+        "returncode", "error", "outdir", "command"
+    ]
     with (output_dir / "run_manifest.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
@@ -351,11 +355,21 @@ def main() -> int:
             outdir = output_dir / profile.name / spec.label
             launcher = [str(GEM5_BIN), f"--outdir={outdir}", str(config)] + config_arguments(spec, args)
             command, cwd = workload_command(profile, launcher, args)
+            is_non_sweep = (
+                spec.mr_mode in {"static", "full"} or 
+                (spec.mr_mode == "off" and 
+                 spec.physreg == BASE_PHYSREG and 
+                 spec.lq_entries == BASE_LQ and 
+                 spec.sq_entries == BASE_SQ and 
+                 spec.load_ports == DEFAULT_PORTS[0] and 
+                 spec.store_ports == DEFAULT_PORTS[1])
+            )
             record = {
                 "profile": profile.name,
                 "profile_path": str(profile.path),
                 "profile_status": profile.status,
                 **asdict(spec),
+                "non_sweep_run": is_non_sweep,
                 "status": "planned",
                 "returncode": None,
                 "error": None,

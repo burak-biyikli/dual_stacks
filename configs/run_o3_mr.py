@@ -28,7 +28,8 @@ system.cpu.valuePred = MemoryRenaming()
 # system.cpu.valuePred.logMaxConfidence = 2
 # system.cpu.valuePred.predictionThreshold = 3
 # system.cpu.valuePred.allocationConfidence = 1
-# system.cpu.valuePred.reallocationConfidence = 1
+# system.cpu.valuePred.reallocationIsPenalty = True
+# system.cpu.valuePred.reallocationAmount = 1
 # system.cpu.valuePred.demotionPenalty = 4
 # system.cpu.valuePred.mrtQueueCapacity = 8
 # system.cpu.valuePred.enableDynamic = True
@@ -56,6 +57,8 @@ system.system_port = system.membus.cpu_side_ports
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--max-insts", type=int, default=100000, help="Max instructions")
+parser.add_argument("--realloc-mode", type=str, choices=["reinit", "penalty"], default="penalty", help="Reallocation mode on producer change")
+parser.add_argument("--realloc-amount", type=int, default=1, help="Reallocation penalty or initialization amount")
 args, remainder = parser.parse_known_args()
 
 if not remainder:
@@ -66,6 +69,8 @@ args.binary = remainder[0]
 args.benchmark_args = remainder[1:]
 
 system.cpu.max_insts_any_thread = args.max_insts
+system.cpu.valuePred.reallocationIsPenalty = (args.realloc_mode == "penalty")
+system.cpu.valuePred.reallocationAmount = args.realloc_amount
 
 system.workload = SEWorkload.init_compatible(args.binary)
 process = Process()

@@ -835,10 +835,10 @@ index 0000000000..25aa51554c
 +
 diff --git a/src/cpu/valuepred/ValuePredictor.py b/src/cpu/valuepred/ValuePredictor.py
 new file mode 100644
-index 0000000000..a16dbed741
+index 0000000000..85f9a2e926
 --- /dev/null
 +++ b/src/cpu/valuepred/ValuePredictor.py
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,37 @@
 +from m5.params import *
 +from m5.proxy import *
 +from m5.SimObject import *
@@ -866,7 +866,8 @@ index 0000000000..a16dbed741
 +    logMaxConfidence = Param.Int(2, "log 2 of max confidence number (2 -> 0..3)")
 +    predictionThreshold = Param.Int(3, "threshold of confidence to enable prediction")
 +    allocationConfidence = Param.Int(1, "starting confidence when a new MRP entry is allocated")
-+    reallocationConfidence = Param.Int(1, "starting confidence when a load changes its producer store PC")
++    reallocationIsPenalty = Param.Bool(True, "If true, subtract reallocationAmount on PC change. If false, reinitialize confidence to reallocationAmount.")
++    reallocationAmount = Param.Int(1, "Amount to reinitialize to, or penalize by, on a producer change")
 +    demotionPenalty = Param.Int(1, "Demotion penalty for wrong prediction or missing store")
 +    mrtQueueCapacity = Param.Int(8, "Capacity of each circular queue in the MRT")
 +    mrtTableCapacity = Param.Int(1024, "Maximum number of Store PCs tracked in the MRT")
@@ -877,10 +878,10 @@ index 0000000000..a16dbed741
 +    enableStatic = Param.Bool(True, "Enable static Memory Renaming path (SRP)")
 diff --git a/src/cpu/valuepred/memory_renaming.cc b/src/cpu/valuepred/memory_renaming.cc
 new file mode 100644
-index 0000000000..039bb99f17
+index 0000000000..bf9bf29f9d
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.cc
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,288 @@
 +#include "cpu/valuepred/memory_renaming.hh"
 +
 +#include <algorithm>
@@ -901,10 +902,11 @@ index 0000000000..039bb99f17
 +    : VPUnit(params),
 +      core(params.ways, 1 << params.logESTBEntrys, params.tagWidth, params.logESTBEntrys,
 +           params.logMaxConfidence, params.predictionThreshold,
-+           params.allocationConfidence, params.reallocationConfidence,
-+           params.demotionPenalty, params.mrtQueueCapacity,
-+           params.committedStoreQueueCapacity, params.enableDynamic,
-+           params.enableStatic, params.mrtTableCapacity, params.numThreads)
++           params.allocationConfidence, params.reallocationIsPenalty,
++           params.reallocationAmount, params.demotionPenalty,
++           params.mrtQueueCapacity, params.committedStoreQueueCapacity,
++           params.enableDynamic, params.enableStatic, params.mrtTableCapacity,
++           params.numThreads)
 +{
 +    uint64_t maxThreshold = (1ULL << params.logMaxConfidence) - 1;
 +    fatal_if(params.predictionThreshold > maxThreshold,
@@ -917,10 +919,12 @@ index 0000000000..039bb99f17
 +             params.allocationConfidence > maxThreshold,
 +             "MemoryRenaming: allocationConfidence (%d) must be in [0, %d].",
 +             params.allocationConfidence, maxThreshold);
-+    fatal_if(params.reallocationConfidence < 0 ||
-+             params.reallocationConfidence > maxThreshold,
-+             "MemoryRenaming: reallocationConfidence (%d) must be in [0, %d].",
-+             params.reallocationConfidence, maxThreshold);
++    fatal_if(params.reallocationAmount < 0,
++             "MemoryRenaming: reallocationAmount (%d) cannot be negative.",
++             params.reallocationAmount);
++    fatal_if(!params.reallocationIsPenalty && params.reallocationAmount > maxThreshold,
++             "MemoryRenaming: reallocationAmount (%d) must be in [0, %d] when reallocationIsPenalty is false.",
++             params.reallocationAmount, maxThreshold);
 +}
 +
 +VPPredictionCandidate
@@ -1251,10 +1255,10 @@ index 0000000000..ba924818c5
 +#endif // __CPU_VALUEPRED_MEMORY_RENAMING_HH__
 diff --git a/src/cpu/valuepred/memory_renaming.test.cc b/src/cpu/valuepred/memory_renaming.test.cc
 new file mode 100644
-index 0000000000..3e69c3a938
+index 0000000000..0dbdba77e4
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.test.cc
-@@ -0,0 +1,756 @@
+@@ -0,0 +1,804 @@
 +#include <gtest/gtest.h>
 +#include <random>
 +#include <vector>
@@ -1278,7 +1282,8 @@ index 0000000000..3e69c3a938
 +            2,      // logMaxConfidence (max=3)
 +            2,      // confidenceThreshold
 +            1,      // allocationConfidence
-+            1,      // reallocationConfidence
++            true,   // reallocationIsPenalty
++            1,      // reallocationAmount
 +            1,      // demotionPenalty
 +            8,      // mrtQueueCapacity
 +            512,    // committedStoreQueueCapacity
@@ -1296,7 +1301,8 @@ index 0000000000..3e69c3a938
 +
 +TEST_F(MemoryRenamingCoreTest, MRPConfidenceAndFreezing)
 +{
-+    auto core = createDefaultCore();
++    auto core = new MemoryRenamingCore<int>(
++        4, 1024, 16, 10, 2, 2, 1, false, 1, 1, 8, 512, true, true, 1024, 1);
 +
 +    Addr loadPC = 0x1000;
 +    Addr storePC = 0x2000;
@@ -1369,7 +1375,7 @@ index 0000000000..3e69c3a938
 +TEST_F(MemoryRenamingCoreTest, MRPReallocationConfidenceFreezesOnPCChange)
 +{
 +    auto core = new MemoryRenamingCore<int>(
-+        4, 1024, 16, 10, 2, 2, 1, 0, 1, 8, 512, true, true, 1024, 1);
++        4, 1024, 16, 10, 2, 2, 1, false, 0, 1, 8, 512, true, true, 1024, 1);
 +
 +    Addr loadPC = 0x1000;
 +    Addr storePC1 = 0x2000;
@@ -1402,6 +1408,48 @@ index 0000000000..3e69c3a938
 +    delete core;
 +}
 +
++TEST_F(MemoryRenamingCoreTest, MRPReallocationPenaltyMode)
++{
++    // Initialize core with reallocationIsPenalty = true, reallocationAmount = 2
++    auto core = new MemoryRenamingCore<int>(
++        4, 1024, 16, 10, 2, 2, 1, true, 2, 1, 8, 512, true, true, 1024, 1);
++
++    Addr loadPC = 0x1000;
++    Addr storePC1 = 0x2000;
++    Addr storePC2 = 0x3000;
++    int offset = 0;
++
++    // Train PC1 to max confidence (3)
++    core->trainMRP(loadPC, storePC1, offset, true); // Allocates: confidence=1
++    core->trainMRP(loadPC, storePC1, offset, true); // confidence=2
++    core->trainMRP(loadPC, storePC1, offset, true); // confidence=3
++
++    // Train PC2 successfully. Because store PC has changed, confidence should drop by reallocationAmount (2) to 1.
++    // Since confidence Threshold is 2, dropping to 1 should also set frozen to true.
++    core->trainMRP(loadPC, storePC2, offset, true);
++
++    int way = -1;
++    for (int i = 0; i < core->ways; i++) {
++        uint32_t idx = core->pcHashToWayIndex(loadPC, i);
++        uint32_t tag = core->pcHashToTag(loadPC, i);
++        auto &entry = core->mrpTable[i][idx];
++        if (entry.valid && core->compareTags(entry.tag, tag) == 0) {
++            way = i;
++            EXPECT_EQ(entry.storePC, storePC2);
++            EXPECT_EQ(entry.confidence, 1);
++            EXPECT_TRUE(entry.frozen);
++            break;
++        }
++    }
++    EXPECT_NE(way, -1);
++
++    bool outFrozen = false;
++    EXPECT_TRUE(core->lookupMRP(loadPC, outFrozen));
++    EXPECT_TRUE(outFrozen);
++
++    delete core;
++}
++
 +TEST_F(MemoryRenamingCoreTest, MRPConfidenceTuneableDemotionAndClamping)
 +{
 +    // Create core with demotionPenalty = 3, threshold = 1, max confidence = 7 (logMaxConfidence = 3)
@@ -1413,7 +1461,8 @@ index 0000000000..3e69c3a938
 +        3,      // logMaxConfidence (max = 7)
 +        1,      // confidenceThreshold
 +        1,      // allocationConfidence
-+        1,      // reallocationConfidence
++        true,   // reallocationIsPenalty
++        1,      // reallocationAmount
 +        3,      // demotionPenalty
 +        8,      // mrtQueueCapacity
 +        512,    // committedStoreQueueCapacity
@@ -1487,7 +1536,8 @@ index 0000000000..3e69c3a938
 +        2,      // logMaxConfidence
 +        2,      // confidenceThreshold
 +        1,      // allocationConfidence
-+        1,      // reallocationConfidence
++        true,   // reallocationIsPenalty
++        1,      // reallocationAmount
 +        1,      // demotionPenalty
 +        8,      // mrtQueueCapacity
 +        512,    // committedStoreQueueCapacity
@@ -1578,7 +1628,8 @@ index 0000000000..3e69c3a938
 +        2,      // logMaxConfidence
 +        2,      // confidenceThreshold
 +        1,      // allocationConfidence
-+        1,      // reallocationConfidence
++        true,   // reallocationIsPenalty
++        1,      // reallocationAmount
 +        1,      // demotionPenalty
 +        8,      // mrtQueueCapacity
 +        512,    // committedStoreQueueCapacity
@@ -1813,7 +1864,8 @@ index 0000000000..3e69c3a938
 +
 +TEST_F(MemoryRenamingCoreTest, DynamicMRTOffsetSelection)
 +{
-+    auto core = createDefaultCore();
++    auto core = new MemoryRenamingCore<int>(
++        4, 1024, 16, 10, 2, 2, 1, false, 1, 1, 8, 512, true, true, 1024, 1);
 +    ThreadID tid = 0;
 +    Addr storePC = 0x2000;
 +    Addr loadPC = 0x3000;
@@ -1883,7 +1935,7 @@ index 0000000000..3e69c3a938
 +TEST_F(MemoryRenamingCoreTest, RSFIFOCapacityEviction)
 +{
 +    auto core = new MemoryRenamingCore<int>(
-+        4, 1024, 16, 10, 2, 2, 1, 1, 1, 8, 3, true, true, 1024, 1);
++        4, 1024, 16, 10, 2, 2, 1, true, 1, 1, 8, 3, true, true, 1024, 1);
 +
 +    for (InstSeqNum sn = 1; sn <= 5; sn++) {
 +        core->commitStore(0x1000 + sn, sn, 0x5000 + sn, 8);
@@ -2237,10 +2289,10 @@ index 0000000000..3f83af734d
 +}
 diff --git a/src/cpu/valuepred/memory_renaming_core.hh b/src/cpu/valuepred/memory_renaming_core.hh
 new file mode 100644
-index 0000000000..aca938d802
+index 0000000000..26292c2884
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_core.hh
-@@ -0,0 +1,733 @@
+@@ -0,0 +1,747 @@
 +#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 +#define __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 +
@@ -2411,7 +2463,8 @@ index 0000000000..aca938d802
 +    const int MAXCONFIDENCE;
 +    const int confidenceThreshold;
 +    const int allocationConfidence;
-+    const int reallocationConfidence;
++    const bool reallocationIsPenalty;
++    const int reallocationAmount;
 +    const int demotionPenalty;
 +    const int mrtQueueCapacity;
 +    const int mrtTableCapacity;
@@ -2436,15 +2489,17 @@ index 0000000000..aca938d802
 +
 +    MemoryRenamingCore(int _ways, int _entryCounts, int _tagWidth, int _logESTBEntrys,
 +                       int _logMaxConfidence, int _confidenceThreshold,
-+                       int _allocationConfidence, int _reallocationConfidence,
-+                       int _demotionPenalty, int _mrtQueueCapacity,
-+                       int _committedStoreQueueCapacity, bool _enableDynamic,
-+                       bool _enableStatic, int _mrtTableCapacity, int numThreads)
++                       int _allocationConfidence, bool _reallocationIsPenalty,
++                       int _reallocationAmount, int _demotionPenalty,
++                       int _mrtQueueCapacity, int _committedStoreQueueCapacity,
++                       bool _enableDynamic, bool _enableStatic,
++                       int _mrtTableCapacity, int numThreads)
 +        : ways(_ways), entryCounts(_entryCounts), tagWidth(_tagWidth), logESTBEntrys(_logESTBEntrys),
 +          logMaxConfidence(_logMaxConfidence), MAXCONFIDENCE((1 << _logMaxConfidence) - 1),
 +          confidenceThreshold(_confidenceThreshold),
 +          allocationConfidence(_allocationConfidence),
-+          reallocationConfidence(_reallocationConfidence),
++          reallocationIsPenalty(_reallocationIsPenalty),
++          reallocationAmount(_reallocationAmount),
 +          demotionPenalty(_demotionPenalty),
 +          mrtQueueCapacity(_mrtQueueCapacity),
 +          mrtTableCapacity(_mrtTableCapacity),
@@ -2545,12 +2600,23 @@ index 0000000000..aca938d802
 +                } else {
 +                    mrpEntry.storePC = storePC;
 +                    mrpEntry.offset = offset;
-+                    mrpEntry.confidence = reallocationConfidence;
-+                    if (reallocationConfidence == allocationConfidence) {
-+                        mrpEntry.frozen = false;
++                    if (reallocationIsPenalty) {
++                        if (mrpEntry.confidence >= reallocationAmount) {
++                            mrpEntry.confidence -= reallocationAmount;
++                        } else {
++                            mrpEntry.confidence = 0;
++                        }
++                        if (mrpEntry.confidence < confidenceThreshold) {
++                            mrpEntry.frozen = true;
++                        }
 +                    } else {
-+                        mrpEntry.frozen =
-+                            reallocationConfidence < confidenceThreshold;
++                        mrpEntry.confidence = reallocationAmount;
++                        if (reallocationAmount == allocationConfidence) {
++                            mrpEntry.frozen = false;
++                        } else {
++                            mrpEntry.frozen =
++                                reallocationAmount < confidenceThreshold;
++                        }
 +                    }
 +                }
 +            } else {
@@ -2976,10 +3042,10 @@ index 0000000000..aca938d802
 +#endif // __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 diff --git a/src/cpu/valuepred/memory_renaming_pipeline_harness.hh b/src/cpu/valuepred/memory_renaming_pipeline_harness.hh
 new file mode 100644
-index 0000000000..fabca2f514
+index 0000000000..db774bfc79
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_pipeline_harness.hh
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,335 @@
 +#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_PIPELINE_HARNESS_HH__
 +#define __CPU_VALUEPRED_MEMORY_RENAMING_PIPELINE_HARNESS_HH__
 +
@@ -3020,7 +3086,8 @@ index 0000000000..fabca2f514
 +        2,      // logMaxConfidence (max=3)
 +        2,      // confidenceThreshold
 +        1,      // allocationConfidence
-+        1,      // reallocationConfidence
++        true,   // reallocationIsPenalty
++        1,      // reallocationAmount
 +        1,      // demotionPenalty
 +        8,      // mrtQueueCapacity
 +        512,    // committedStoreQueueCapacity

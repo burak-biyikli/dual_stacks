@@ -91,21 +91,26 @@ for test_dir in */; do
                 fi
                 
                 trace_stock="$out_dir/trace_stock.txt"
-                trace_mr="$out_dir/trace_mr.txt"
+                trace_mr_penalty="$out_dir/trace_mr_penalty.txt"
+                trace_mr_reinit="$out_dir/trace_mr_reinit.txt"
                 clean_stock="$out_dir/trace_stock_clean.txt"
-                clean_mr="$out_dir/trace_mr_clean.txt"
+                clean_mr_penalty="$out_dir/trace_mr_penalty_clean.txt"
+                clean_mr_reinit="$out_dir/trace_mr_reinit_clean.txt"
 
                 # 2. Run Simulations
                 set +e
                 "$GEM5_BIN" --debug-flags=Exec --debug-file=trace_stock.txt --stats-file=stats_stock.txt --outdir="$out_dir" "$ROOT_DIR/configs/run_o3_stock.py" "$bin_file" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
                 stock_status=$?
                 
-                "$GEM5_BIN" --debug-flags=Exec --debug-file=trace_mr.txt --stats-file=stats_mr.txt --outdir="$out_dir" "$ROOT_DIR/configs/run_o3_mr.py" "$bin_file" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
-                mr_status=$?
+                "$GEM5_BIN" --debug-flags=Exec --debug-file=trace_mr_penalty.txt --stats-file=stats_mr_penalty.txt --outdir="$out_dir" "$ROOT_DIR/configs/run_o3_mr.py" "$bin_file" --realloc-mode penalty --realloc-amount 1 >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
+                mr_pen_status=$?
+
+                "$GEM5_BIN" --debug-flags=Exec --debug-file=trace_mr_reinit.txt --stats-file=stats_mr_reinit.txt --outdir="$out_dir" "$ROOT_DIR/configs/run_o3_mr.py" "$bin_file" --realloc-mode reinit --realloc-amount 1 >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
+                mr_reinit_status=$?
                 set -e
                 
-                if [ $stock_status -ne 0 ] || [ $mr_status -ne 0 ]; then
-                    echo "    [FAIL] Simulation CRASHED (Stock exit: $stock_status, MR exit: $mr_status). See:"
+                if [ $stock_status -ne 0 ] || [ $mr_pen_status -ne 0 ] || [ $mr_reinit_status -ne 0 ]; then
+                    echo "    [FAIL] Simulation CRASHED (Stock exit: $stock_status, MR Penalty exit: $mr_pen_status, MR Reinit exit: $mr_reinit_status). See:"
                     echo "    stderr: $STDERR_LOG"
                     echo "    stdout: $STDOUT_LOG"
                     FAILURES=$((FAILURES + 1))
@@ -115,7 +120,8 @@ for test_dir in */; do
                 # 3. Check Stats
                 stats_failed=0
                 "$SCRIPT_DIR/check_stats.py" "stock" "$test_name" "$out_dir/stats_stock.txt" || stats_failed=1
-                "$SCRIPT_DIR/check_stats.py" "mr" "$test_name" "$out_dir/stats_mr.txt" || stats_failed=1
+                "$SCRIPT_DIR/check_stats.py" "mr" "$test_name" "$out_dir/stats_mr_penalty.txt" || stats_failed=1
+                "$SCRIPT_DIR/check_stats.py" "mr" "$test_name" "$out_dir/stats_mr_reinit.txt" || stats_failed=1
                 
                 if [ $stats_failed -eq 1 ]; then
                     FAILURES=$((FAILURES + 1))
@@ -124,9 +130,25 @@ for test_dir in */; do
                 
                 # 4. Parse & Diff Traces
                 "$SCRIPT_DIR/parse_traces.py" "$trace_stock" "$clean_stock" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
-                "$SCRIPT_DIR/parse_traces.py" "$trace_mr" "$clean_mr" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
+                "$SCRIPT_DIR/parse_traces.py" "$trace_mr_penalty" "$clean_mr_penalty" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
+                "$SCRIPT_DIR/parse_traces.py" "$trace_mr_reinit" "$clean_mr_reinit" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
                 
-                if diff "$clean_stock" "$clean_mr" > "$out_dir/trace_diff.txt"; then
+                penalty_diff_failed=0
+                reinit_diff_failed=0
+                
+                if diff "$clean_stock" "$clean_mr_penalty" > "$out_dir/trace_diff_penalty.txt"; then
+                    :
+                else
+                    penalty_diff_failed=1
+                fi
+                
+                if diff "$clean_stock" "$clean_mr_reinit" > "$out_dir/trace_diff_reinit.txt"; then
+                    :
+                else
+                    reinit_diff_failed=1
+                fi
+                
+                if [ $penalty_diff_failed -eq 0 ] && [ $reinit_diff_failed -eq 0 ]; then
                     if [ "$VERBOSE" -eq 1 ]; then
                         echo "    [PASS] Traces match perfectly!"
                     fi
@@ -134,7 +156,12 @@ for test_dir in */; do
                     echo "    [FAIL] Traces diverged! See:"
                     echo "    stderr: $STDERR_LOG"
                     echo "    stdout: $STDOUT_LOG"
-                    echo "    divergence diff: $out_dir/trace_diff.txt"
+                    if [ $penalty_diff_failed -eq 1 ]; then
+                        echo "    divergence diff (penalty): $out_dir/trace_diff_penalty.txt"
+                    fi
+                    if [ $reinit_diff_failed -eq 1 ]; then
+                        echo "    divergence diff (reinit): $out_dir/trace_diff_reinit.txt"
+                    fi
                     FAILURES=$((FAILURES + 1))
                 fi
             fi

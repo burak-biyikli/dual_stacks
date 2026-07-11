@@ -124,6 +124,8 @@ def configure_cpu(cpu, args) -> None:
         predictor = MemoryRenaming()
         predictor.enableStatic = True
         predictor.enableDynamic = args.mr_mode == "full"
+        predictor.reallocationIsPenalty = True
+        predictor.reallocationAmount = 1
         cpu.valuePred = predictor
 
 
