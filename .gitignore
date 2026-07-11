@@ -14,7 +14,16 @@ __pycache__/
 # IDEs
 .vscode/
 .idea/
+
+# Study outputs, manually add desired runs!
 results/dr_tool_runs/
+!results/dr_tool_runs/.gitkeep
+results/gem5_sim_runs/
+!results/gem5_sim_runs/.gitkeep
+
+# Temp files used by scripts (Not in Repo)
+# /tmp/gem5_dual_stacks_tests/
+# /tmp/dr_analyzer_fifo_*
 
 # gem5 test executables (compiled binaries)
 tools/gem5_tests/*/*

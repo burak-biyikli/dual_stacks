@@ -7,9 +7,15 @@ This repository provides an automated, end-to-end pipeline for performing microa
 * **`ext/`**: Upstream dependencies managed as git submodules (`gem5`, `dynamorio`, `gapbs`, `parsec-benchmark`).
 * **`configs/`**: Our custom gem5 python system configuration scripts (where we apply our hardware modifications).
 * **`patches/`**: Diff files containing our custom C++ modifications to the upstream `ext/` submodules.
-* **`results/`**: Output data, containing trace summaries, generated configurations, and gem5 `stats.txt` runs.
+* **`results/`**: Output data organized by pipeline stage:
+  * `dr_tool_runs/` - Timestamped directories containing DynamoRIO profiling output (`parsed_data.json`, stdout/stderr logs).
+  * `gem5_sim_runs/` - Timestamped directories containing gem5 simulation results (`stats.txt`, `run_manifest.json`).
+  * `tmp/` - Intermediate/test outputs (symlinks to m5out directories, temporary files).
 * **`scripts/`**: Automation scripts for executing the end-to-end pipeline.
-* **`tools/`**: Custom tools and test programs. Notably `trace_analyzer`, which is our DynamoRIO C++ client.
+* **`tools/`**: Custom tools and test programs. Notably `trace_analyzer`, which is our DynamoRIO C++ client, and `gem5_tests/` for validation.
+* **`/tmp`**: Temp files used by scripts
+  * `/tmp/gem5_dual_stacks_tests/` - Simulation files used by `gem5_tests/`
+  * `/tmp/dr_analyzer_fifo_*` - Temp files used by `trace_analyzer`
 
 > [!NOTE]
 > **Synthetic (`-g`) vs. Real-World Datasets**
@@ -30,9 +36,10 @@ The pipeline is split into distinct, sequentially executable scripts for ease of
 * **`02_test.sh`**: Health check script that executes "Hello World" sanity checks on the native machine, DynamoRIO, GAPBS, PARSEC, and gem5 to ensure everything is functioning.
 * **`03_profile_workloads.py`**: Executes the PARSEC and GAPBS benchmark suites under the DynamoRIO `trace_analyzer` client and extracts metrics to `results/dr_tool_runs/`.
 * **`04_summarize_results.py`**: Parses the raw JSON metrics from `03_profile_workloads.py` and outputs tabulated distributions of stack privacy and IPC.
+* **`05_run_simulations.py`**: Manifest-driven runner for gem5 macrobenchmark studies. Uses profiles from `results/dr_tool_runs/` to configure and execute simulations, writing results to `results/gem5_sim_runs/`.
 
 > [!TIP]
 > **Timeout for Long-Running Profiling**
 > Because heavy C++ workloads (e.g., `bodytrack`) can take a very long time to execute under dense DynamoRIO tracing, `03_profile_workloads.py` supports a `--timeout <seconds>` flag. Using this flag safely wraps the execution in a signal-terminating boundary. If the timeout is hit, the custom DynamoRIO client intercepts the `SIGTERM` and executes a clean termination, gracefully flushing all hash tables and outputting whatever data was successfully collected before the timeout expired.
 
-*(Future scripts to be added: `05_run_simulations.py`, `06_extract_data.py`)*
+*(Future scripts to be added: `06_extract_data.py)*

@@ -2967,10 +2967,10 @@ index 0000000000..aca938d802
 +#endif // __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 diff --git a/src/cpu/valuepred/memory_renaming_pipeline_harness.hh b/src/cpu/valuepred/memory_renaming_pipeline_harness.hh
 new file mode 100644
-index 0000000000..e9cd55e5de
+index 0000000000..fabca2f514
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_pipeline_harness.hh
-@@ -0,0 +1,333 @@
+@@ -0,0 +1,334 @@
 +#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_PIPELINE_HARNESS_HH__
 +#define __CPU_VALUEPRED_MEMORY_RENAMING_PIPELINE_HARNESS_HH__
 +
@@ -3017,6 +3017,7 @@ index 0000000000..e9cd55e5de
 +        512,    // committedStoreQueueCapacity
 +        true,   // enableDynamic
 +        true,   // enableStatic
++        1024,   // mrtTableCapacity
 +        1       // numThreads
 +    );
 +}

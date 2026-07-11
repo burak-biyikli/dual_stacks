@@ -73,7 +73,7 @@ SquashRollbackMRTAndSRP         MRT tail rollback, SRP push removal, popped-
 
 
 ================================================================================
-LAYER 2: RENAME-STAGE PIPELINE HARNESS
+LAYER 2A: RENAME-STAGE PIPELINE HARNESS
 ================================================================================
 
 Harness header (shared, update here when production hooks change):
@@ -115,7 +115,7 @@ RenameCommitIntegration           Rename + commit harnesses wired together for
 
 
 ================================================================================
-LAYER 3: COMMIT-STAGE PIPELINE HARNESS
+LAYER 2B: COMMIT-STAGE PIPELINE HARNESS
 ================================================================================
 
 Harness header (same file as Layer 2):
@@ -154,7 +154,7 @@ RenameCommitEndToEndMRPThreshold  Full rename+commit loop reaches MRP threshold
 
 
 ================================================================================
-LAYER 4: O3 CPU MICROBENCHMARKS
+LAYER 3: O3 CPU MICROBENCHMARKS
 ================================================================================
 
 Each subdirectory contains a bare-metal X86 assembly program (`*.S`). The test
