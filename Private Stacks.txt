@@ -106,18 +106,24 @@ Compiler changes
 
 
 
-Experiments:
-* Oracle study: What percent of LSU entries/LDST slots might be saved in a typical workload?
-   * Can do trace analysis on multicore workloads to determine distribution
+Tracing Experiments:
+* What percent of LSU entries might be saved in a typical workload?
+   * Can do trace analysis on multicore workloads to determine distribution of private stack accesses in normal workloads
+* What percent of LDST slots might be saved in a typical workload?
+   * Can do trace analysis to create a histogram of accesses
+
+Performance Model Experiments:
 * Timing study: How do naive LSU, LSU with stack forwarding, and private stack compare in terms of performance?
-   * Can estimate the roofline of this using gem5 without real toolchain support. Naive LSU, Aggressive LSU, Oversized LSU based on trace data
+   * How sensitive is a workload to LSU ST->LD latency? Can estimate the roofline of this using gem5 without real toolchain support. Naive LSU, Aggressive LSU, Oversized LSU based on trace data
 * What is the register file pressure compared to the stack lifetime?
    * The lower the register file pressure, and the shorter the stack lifetime the more memory operations can be entirely elided
+      * Follows on from tracing Experiments, increase LSU LD/ST queues in proportion to pops/loads and pushes/stores
    * A widget could trade memory bandwidth for register pressure. 
       * Maybe can do two measurements. Will see if the workload is bandwidth sensitive by changing LSU <-> L1$ width while recording the perf and the register pressure. 
       * If the natural register pressure is low, we can consult the stack histogram to see how much bandwidth we might be able to save. We could also see how sensitive the workload is to PRF by artificially restricting it
+   * Perform two independent sweeps. One to determine PRF sensitivity (Can we steal registers without overly impacting perf), and one to determine bandwidth sensitivity (If we trade registers for bandwidth is there upside)
 
-
+Analytical Model Experiments:
 * What is the cost of doing thread migration with these changes?
    * We are deferring some loads, and negating others? What is the change with respect to bandwidth requirements of the core?
    * Maybe an analytical model (Google sheets?)
