@@ -1,0 +1,12 @@
+Global frequency set at 1000000000000 ticks per second
+gem5 Simulator System.  https://www.gem5.org
+gem5 is copyrighted software; use the --copyright option for details.
+
+gem5 version 25.1.0.1
+gem5 compiled Jul 10 2026 22:04:46
+gem5 started Jul 10 2026 23:28:36
+gem5 executing on MiniITX-PC, pid 646046
+command line: /home/bbiyikli/Desktop/dual_stacks/ext/gem5/build/X86/gem5.opt --outdir=/home/bbiyikli/Desktop/dual_stacks/results/gem5_sim_runs/2026-07-10_23-27-16/gapbs_bc_test/mr_static_trace_lsu /home/bbiyikli/Desktop/dual_stacks/configs/run_o3_benchmark_single.py --mr-mode static --physreg 180 --lq-entries 72 --sq-entries 53 --load-ports 2 --store-ports 1 --max-insts 1000000 /home/bbiyikli/Desktop/dual_stacks/ext/gapbs/bc -g 10 -n 1
+
+Beginning simulation!
+Exiting @ tick 540018250 because a thread reached the max instruction count

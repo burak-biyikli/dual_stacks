@@ -1,0 +1,68 @@
+[PARSEC] Benchmarks to run:  parsec.x264
+
+[PARSEC] [========== Running benchmark parsec.x264 [1] ==========]
+[PARSEC] Deleting old run directory.
+[PARSEC] Setting up run directory.
+[PARSEC] Unpacking benchmark input 'test'.
+eledream_32x18_1.y4m
+[PARSEC] Running '/home/bbiyikli/Desktop/dual_stacks/ext/gem5/build/X86/gem5.opt --outdir=/home/bbiyikli/Desktop/dual_stacks/results/gem5_sim_runs/2026-07-10_23-27-16/parsec_x264_test/mr_static /home/bbiyikli/Desktop/dual_stacks/configs/run_o3_benchmark_single.py --mr-mode static --physreg 180 --lq-entries 72 --sq-entries 56 --load-ports 2 --store-ports 1 --max-insts 1000000 /home/bbiyikli/Desktop/dual_stacks/ext/parsec-benchmark/pkgs/apps/x264/inst/amd64-linux.gcc/bin/x264 --quiet --qp 20 --partitions b8x8,i4x4 --ref 5 --direct auto --b-pyramid --weightb --mixed-refs --no-fast-pskip --me umh --subme 7 --analyse b8x8,i4x4 --threads 1 -o eledream.264 eledream_32x18_1.y4m':
+[PARSEC] [---------- Beginning of output ----------]
+Global frequency set at 1000000000000 ticks per second
+warn: No dot file generated. Please install pydot to generate the dot file and pdf.
+src/mem/dram_interface.cc:690: warn: DRAM device capacity (32768 Mbytes) does not match the address range assigned (8192 Mbytes)
+src/base/statistics.hh:279: warn: One of the stats is a legacy stat. Legacy stat is a stat that does not belong to any statistics::Group. Legacy stat is deprecated.
+src/base/stats/storage.hh:278: warn: Bucket size (4) does not divide range [1:32] into equal-sized buckets. Rounding up.
+src/base/stats/storage.hh:278: warn: Bucket size (4) does not divide range [1:8] into equal-sized buckets. Rounding up.
+system.remote_gdb: Listening for connections on port 7000
+gem5 Simulator System.  https://www.gem5.org
+gem5 is copyrighted software; use the --copyright option for details.
+
+gem5 version 25.1.0.1
+gem5 compiled Jul 10 2026 22:04:46
+gem5 started Jul 10 2026 23:49:14
+gem5 executing on MiniITX-PC, pid 684467
+command line: /home/bbiyikli/Desktop/dual_stacks/ext/gem5/build/X86/gem5.opt --outdir=/home/bbiyikli/Desktop/dual_stacks/results/gem5_sim_runs/2026-07-10_23-27-16/parsec_x264_test/mr_static /home/bbiyikli/Desktop/dual_stacks/configs/run_o3_benchmark_single.py --mr-mode static --physreg 180 --lq-entries 72 --sq-entries 56 --load-ports 2 --store-ports 1 --max-insts 1000000 /home/bbiyikli/Desktop/dual_stacks/ext/parsec-benchmark/pkgs/apps/x264/inst/amd64-linux.gcc/bin/x264 --quiet --qp 20 --partitions b8x8,i4x4 --ref 5 --direct auto --b-pyramid --weightb --mixed-refs --no-fast-pskip --me umh --subme 7 --analyse b8x8,i4x4 --threads 1 -o eledream.264 eledream_32x18_1.y4m
+
+Beginning simulation!
+src/sim/mem_state.cc:443: info: Increasing stack size by one page.
+src/base/loader/symtab.cc:95: warn: Cannot insert a new symbol table due to name collisions. Adding prefix to each symbol's name can resolve this issue.
+src/base/loader/symtab.cc:95: warn: Cannot insert a new symbol table due to name collisions. Adding prefix to each symbol's name can resolve this issue.
+src/base/loader/symtab.cc:95: warn: Cannot insert a new symbol table due to name collisions. Adding prefix to each symbol's name can resolve this issue.
+src/sim/syscall_emul.cc:86: warn: ignoring syscall set_robust_list(...)
+src/sim/syscall_emul.cc:86: warn: ignoring syscall rseq(...)
+src/sim/syscall_emul.cc:86: warn: ignoring syscall mprotect(...)
+src/sim/syscall_emul.cc:86: warn: ignoring syscall mprotect(...)
+src/sim/syscall_emul.cc:86: warn: ignoring syscall mprotect(...)
+src/sim/syscall_emul.cc:86: warn: ignoring syscall mprotect(...)
+src/sim/syscall_emul.cc:86: warn: ignoring syscall mprotect(...)
+PARSEC Benchmark Suite Version 3.0-beta-20150206
+yuv4mpeg: 32x18@25/1fps, 0:0
+src/sim/syscall_emul.cc:97: warn: ignoring syscall rt_sigaction(...)
+      (further warnings will be suppressed)
+src/sim/mem_state.cc:443: info: Increasing stack size by one page.
+src/sim/mem_state.cc:443: info: Increasing stack size by one page.
+build/X86/arch/x86/generated/exec-ns.cc.inc:27: warn: instruction 'prefetch_nta' unimplemented
+src/arch/generic/debugfaults.hh:145: warn: MOVNTQ: Ignoring non-temporal hint, modeling as cacheable!
+build/X86/arch/x86/generated/exec-ns.cc.inc:27: warn: instruction 'pabsw_Pq_Qq' unimplemented
+build/X86/arch/x86/generated/exec-ns.cc.inc:27: warn: instruction 'pabsw_Pq_Qq' unimplemented
+build/X86/arch/x86/generated/exec-ns.cc.inc:27: warn: instruction 'pabsw_Pq_Qq' unimplemented
+build/X86/arch/x86/generated/exec-ns.cc.inc:27: warn: instruction 'pabsw_Pq_Qq' unimplemented
+src/sim/mem_state.cc:443: info: Increasing stack size by one page.
+build/X86/arch/x86/generated/exec-ns.cc.inc:27: warn: instruction 'psignw_Vdq_Wdq' unimplemented
+build/X86/arch/x86/generated/exec-ns.cc.inc:27: warn: instruction 'pabsw_Pq_Qq' unimplemented
+build/X86/arch/x86/generated/exec-ns.cc.inc:27: warn: instruction 'psignw_Pq_Qq' unimplemented
+build/X86/arch/x86/generated/exec-ns.cc.inc:27: warn: instruction 'pshufb_Pq_Qq' unimplemented
+src/arch/generic/debugfaults.hh:145: warn: MOVNTPS: Ignoring non-temporal hint, modeling as cacheable!
+build/X86/arch/x86/generated/exec-ns.cc.inc:27: warn: instruction 'pabsw_Pq_Qq' unimplemented
+build/X86/arch/x86/generated/exec-ns.cc.inc:27: warn: instruction 'pabsw_Pq_Qq' unimplemented
+build/X86/arch/x86/generated/exec-ns.cc.inc:27: warn: instruction 'pabsw_Pq_Qq' unimplemented
+build/X86/arch/x86/generated/exec-ns.cc.inc:27: warn: instruction 'pabsw_Pq_Qq' unimplemented
+build/X86/arch/x86/generated/exec-ns.cc.inc:27: warn: instruction 'pabsw_Pq_Qq' unimplemented
+Exiting @ tick 615911250 because a thread reached the max instruction count
+[PARSEC] [----------    End of output    ----------]
+[PARSEC]
+[PARSEC] BIBLIOGRAPHY
+[PARSEC]
+[PARSEC] [1] Bienia. Benchmarking Modern Multiprocessors. Ph.D. Thesis, 2011.
+[PARSEC]
+[PARSEC] Done.

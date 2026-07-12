@@ -146,7 +146,7 @@ def sanity_check_runs(sim_dir: Path, runs: list[dict]) -> None:
             outdir = Path(run["outdir"])
             stats_txt = outdir / "stats.txt"
             if not stats_txt.is_file():
-                finished_but_no_stats.append(f"{run['profile']} / {run.get('label', 'unknown')}")
+                finished_but_no_stats.append(f"{run['profile']} / {run.get('config_label', 'unknown')}")
 
     if finished_but_no_stats:
         print(f"Warning: {len(finished_but_no_stats)} runs are marked 'finished' in manifest but missing 'stats.txt'.", file=sys.stderr)

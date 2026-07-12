@@ -113,7 +113,7 @@ def load_profiles(profile_dir: Path, sizes: set[str], benchmarks: set[str]) -> t
     return profiles, skipped
 
 
-def workload_command(profile: Profile, launcher: list[str], threads: int) -> tuple[list[str], Path]:
+def workload_command(profile: Profile, launcher: list[str], threads: int, outdir: Path) -> tuple[list[str], Path]:
     if profile.suite == "gapbs":
         binary = EXT_DIR / "gapbs" / profile.benchmark
         command = launcher + [str(binary), "-g", str(SIZE_MAP[profile.size]["gapbs"]), "-n", str(threads)]
@@ -122,7 +122,11 @@ def workload_command(profile: Profile, launcher: list[str], threads: int) -> tup
         return command, ROOT_DIR
     parsecmgmt = EXT_DIR / "parsec-benchmark/bin/parsecmgmt"
     launcher_text = shlex.join(launcher)
-    command = [str(parsecmgmt), "-a", "run", "-p", profile.benchmark, "-c", "gcc", "-i", SIZE_MAP[profile.size]["parsec"], "-n", str(threads), "-s", launcher_text]
+    command = [
+        str(parsecmgmt), "-a", "run", "-p", profile.benchmark, "-c", "gcc",
+        "-i", SIZE_MAP[profile.size]["parsec"], "-n", str(threads),
+        "-d", str(outdir), "-s", launcher_text
+    ]
     return command, EXT_DIR / "parsec-benchmark"
 
 
@@ -433,7 +437,7 @@ def main() -> int:
             gem5_config_path = CONFIGS[gem5_cfg_name]
             launcher = [str(GEM5_BIN), f"--outdir={outdir}", str(gem5_config_path)] + gem5_args
             
-            command, cwd = workload_command(profile, launcher, threads)
+            command, cwd = workload_command(profile, launcher, threads, outdir)
             
             record = {
                 "profile": profile.name,

@@ -1,0 +1,3 @@
+OS: Linux MiniITX-PC 6.19.10-300.fc44.x86_64 #1 SMP PREEMPT_DYNAMIC Wed Mar 25 18:23:49 UTC 2026 x86_64 GNU/Linux
+CPU: AMD Ryzen 7 3700X 8-Core Processor
+Git Hash: 2a8df74bcbcbf9f1b3c393cc05fc9244d14950bc (dirty)

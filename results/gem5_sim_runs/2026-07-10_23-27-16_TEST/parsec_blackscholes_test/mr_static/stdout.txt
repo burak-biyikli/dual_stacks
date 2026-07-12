@@ -1,0 +1,43 @@
+[PARSEC] Benchmarks to run:  parsec.blackscholes
+
+[PARSEC] [========== Running benchmark parsec.blackscholes [1] ==========]
+[PARSEC] Deleting old run directory.
+[PARSEC] Setting up run directory.
+[PARSEC] Unpacking benchmark input 'test'.
+in_4.txt
+[PARSEC] Running '/home/bbiyikli/Desktop/dual_stacks/ext/gem5/build/X86/gem5.opt --outdir=/home/bbiyikli/Desktop/dual_stacks/results/gem5_sim_runs/2026-07-10_23-27-16/parsec_blackscholes_test/mr_static /home/bbiyikli/Desktop/dual_stacks/configs/run_o3_benchmark_single.py --mr-mode static --physreg 180 --lq-entries 72 --sq-entries 56 --load-ports 2 --store-ports 1 --max-insts 1000000 /home/bbiyikli/Desktop/dual_stacks/ext/parsec-benchmark/pkgs/apps/blackscholes/inst/amd64-linux.gcc/bin/blackscholes 1 in_4.txt prices.txt':
+[PARSEC] [---------- Beginning of output ----------]
+Global frequency set at 1000000000000 ticks per second
+warn: No dot file generated. Please install pydot to generate the dot file and pdf.
+src/mem/dram_interface.cc:690: warn: DRAM device capacity (32768 Mbytes) does not match the address range assigned (8192 Mbytes)
+src/base/statistics.hh:279: warn: One of the stats is a legacy stat. Legacy stat is a stat that does not belong to any statistics::Group. Legacy stat is deprecated.
+src/base/stats/storage.hh:278: warn: Bucket size (4) does not divide range [1:32] into equal-sized buckets. Rounding up.
+src/base/stats/storage.hh:278: warn: Bucket size (4) does not divide range [1:8] into equal-sized buckets. Rounding up.
+system.remote_gdb: Listening for connections on port 7000
+gem5 Simulator System.  https://www.gem5.org
+gem5 is copyrighted software; use the --copyright option for details.
+
+gem5 version 25.1.0.1
+gem5 compiled Jul 10 2026 22:04:46
+gem5 started Jul 10 2026 23:35:20
+gem5 executing on MiniITX-PC, pid 648658
+command line: /home/bbiyikli/Desktop/dual_stacks/ext/gem5/build/X86/gem5.opt --outdir=/home/bbiyikli/Desktop/dual_stacks/results/gem5_sim_runs/2026-07-10_23-27-16/parsec_blackscholes_test/mr_static /home/bbiyikli/Desktop/dual_stacks/configs/run_o3_benchmark_single.py --mr-mode static --physreg 180 --lq-entries 72 --sq-entries 56 --load-ports 2 --store-ports 1 --max-insts 1000000 /home/bbiyikli/Desktop/dual_stacks/ext/parsec-benchmark/pkgs/apps/blackscholes/inst/amd64-linux.gcc/bin/blackscholes 1 in_4.txt prices.txt
+
+Beginning simulation!
+src/sim/mem_state.cc:443: info: Increasing stack size by one page.
+src/base/loader/symtab.cc:95: warn: Cannot insert a new symbol table due to name collisions. Adding prefix to each symbol's name can resolve this issue.
+src/base/loader/symtab.cc:95: warn: Cannot insert a new symbol table due to name collisions. Adding prefix to each symbol's name can resolve this issue.
+src/base/loader/symtab.cc:95: warn: Cannot insert a new symbol table due to name collisions. Adding prefix to each symbol's name can resolve this issue.
+src/sim/syscall_emul.cc:86: warn: ignoring syscall set_robust_list(...)
+src/sim/syscall_emul.cc:86: warn: ignoring syscall rseq(...)
+src/sim/syscall_emul.cc:86: warn: ignoring syscall mprotect(...)
+src/sim/syscall_emul.cc:86: warn: ignoring syscall mprotect(...)
+src/sim/syscall_emul.cc:86: warn: ignoring syscall mprotect(...)
+Exiting @ tick 521426750 because a thread reached the max instruction count
+[PARSEC] [----------    End of output    ----------]
+[PARSEC]
+[PARSEC] BIBLIOGRAPHY
+[PARSEC]
+[PARSEC] [1] Bienia. Benchmarking Modern Multiprocessors. Ph.D. Thesis, 2011.
+[PARSEC]
+[PARSEC] Done.
