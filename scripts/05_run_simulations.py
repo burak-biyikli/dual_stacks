@@ -209,14 +209,22 @@ def load_experiments(experiment_file: Path) -> tuple[list[dict[str, Any]], dict[
 def get_config_label(run_dict: dict[str, Any], global_defaults: dict[str, Any]) -> str:
     mr_mode = run_dict.get("mr_mode", "off")
     physreg = run_dict.get("physreg", 180)
-    lq = run_dict.get("lq_entries", 72)
-    sq = run_dict.get("sq_entries", 56)
+    
+    b_lq = global_defaults.get("lq_entries", 72)
+    b_sq = global_defaults.get("sq_entries", 56)
+    
+    lq = run_dict.get("lq_entries", b_lq)
+    sq = run_dict.get("sq_entries", b_sq)
+    
+    lq_str = "ts" if isinstance(lq, str) and lq.startswith("trace-scaled") else str(lq)
+    sq_str = "ts" if isinstance(sq, str) and sq.startswith("trace-scaled") else str(sq)
+    
     load_ports = run_dict.get("load_ports", 2)
     store_ports = run_dict.get("store_ports", 1)
     num_cores = run_dict.get("num_cores", 1)
     
     if mr_mode == "off":
-        if physreg == 180 and lq == 72 and sq == 56 and load_ports == 2 and store_ports == 1:
+        if physreg == 180 and lq == b_lq and sq == b_sq and load_ports == 2 and store_ports == 1:
             base = "stock"
         else:
             parts = []
@@ -224,8 +232,8 @@ def get_config_label(run_dict: dict[str, Any], global_defaults: dict[str, Any]) 
                 parts.append(f"prf_{physreg}")
             if load_ports != 2 or store_ports != 1:
                 parts.append(f"bw_{load_ports}x{store_ports}")
-            if lq != 72 or sq != 56:
-                parts.append(f"lq{lq}_sq{sq}")
+            if lq != b_lq or sq != b_sq:
+                parts.append(f"lq{lq_str}_sq{sq_str}")
             base = "stock_" + "_".join(parts) if parts else "stock"
     else:
         log_max_conf = run_dict.get("mrp_log_max_confidence")
@@ -240,15 +248,15 @@ def get_config_label(run_dict: dict[str, Any], global_defaults: dict[str, Any]) 
             base = "default_2bit"
         elif log_max_conf is None and pred_thresh is None and alloc_conf is None and demotion is None and realloc is None and reinit is None:
             if mr_mode == "static":
-                if lq == 72 and sq == 56:
+                if lq == b_lq and sq == b_sq:
                     base = "mr_static"
                 else:
-                    base = f"mr_static_lq{lq}_sq{sq}"
+                    base = f"mr_static_lq{lq_str}_sq{sq_str}"
             elif mr_mode == "full":
-                if lq == 72 and sq == 56:
+                if lq == b_lq and sq == b_sq:
                     base = "mr_full"
                 else:
-                    base = f"mr_full_lq{lq}_sq{sq}"
+                    base = f"mr_full_lq{lq_str}_sq{sq_str}"
             else:
                 base = "mr_unknown"
         else:
@@ -265,8 +273,8 @@ def get_config_label(run_dict: dict[str, Any], global_defaults: dict[str, Any]) 
             if reinit is not None:
                 parts.append(f"ri{reinit}")
             
-            if lq != 72 or sq != 56:
-                parts.append(f"lq{lq}_sq{sq}")
+            if lq != b_lq or sq != b_sq:
+                parts.append(f"lq{lq_str}_sq{sq_str}")
             if physreg != 180:
                 parts.append(f"prf{physreg}")
                 
@@ -470,7 +478,56 @@ def main() -> int:
             if threads != num_cores:
                 print(f"Warning: OpenMP threads ({threads}) != num_cores ({num_cores}). This may cause artificial scheduling overhead.", file=sys.stderr)
                 
+            # Generate the configuration label immediately.
+            # This ensures get_config_label sees the literal string "trace-scaled".
             config_label = get_config_label(params, globals_dict)
+            
+            # Resolve "trace-scaled" queue sizes if specified
+            base_lq = globals_dict.get("lq_entries", 72)
+            base_sq = globals_dict.get("sq_entries", 56)
+            
+            lq_val = params.get("lq_entries")
+            sq_val = params.get("sq_entries")
+            
+            if (isinstance(lq_val, str) and lq_val.startswith("trace-scaled")) or \
+               (isinstance(sq_val, str) and sq_val.startswith("trace-scaled")):
+                
+                memory_ops = profile.data.get("memory_ops", {})
+                loads = memory_ops.get("loads", 1)
+                stores = memory_ops.get("stores", 1)
+                pushes = memory_ops.get("pushes", 0)
+                pops = memory_ops.get("pops", 0)
+                
+                load_pop_ratio = pops / loads if loads > 0 else 0.0
+                store_push_ratio = pushes / stores if stores > 0 else 0.0
+                
+                stack_ops = profile.data.get("stack_ops", {})
+                stack_total = stack_ops.get("total", 1)
+                
+                # Helper function to get private percentage for a given spec
+                def get_private_percentage(spec: str) -> float:
+                    if spec == "trace-scaled-strict":
+                        selected_ipc = stack_ops.get("strictly_ipc", 0)
+                    elif spec == "trace-scaled-history":
+                        selected_ipc = stack_ops.get("possibly_ipc_hist", 0)
+                    elif spec == "trace-scaled-non-history":
+                        selected_ipc = stack_ops.get("possibly_ipc_non_hist", 0)
+                    else:  # default "trace-scaled"
+                        selected_ipc = stack_total - stack_ops.get("provably_private", 0)
+                    
+                    priv_pct = (stack_total - selected_ipc) / stack_total if stack_total > 0 else 0.0
+                    return min(max(0.0, priv_pct), 0.95)
+                
+                if isinstance(lq_val, str) and lq_val.startswith("trace-scaled"):
+                    lq_priv_pct = get_private_percentage(lq_val)
+                    lq_factor = min(load_pop_ratio * lq_priv_pct, 0.95)
+                    params["lq_entries"] = int(base_lq / (1.0 - lq_factor))
+                    
+                if isinstance(sq_val, str) and sq_val.startswith("trace-scaled"):
+                    sq_priv_pct = get_private_percentage(sq_val)
+                    sq_factor = min(store_push_ratio * sq_priv_pct, 0.95)
+                    params["sq_entries"] = int(base_sq / (1.0 - sq_factor))
+            
             outdir = output_dir / profile.name / config_label
             
             gem5_args = build_gem5_args(params)

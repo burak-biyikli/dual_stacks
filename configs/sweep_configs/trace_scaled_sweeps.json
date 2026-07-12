@@ -27,13 +27,15 @@
       }
     },
     {
-      "name": "mr_trace_scaled",
+      "name": "trace_scaled_sweeps",
       "matrix": {
         "mr_mode": ["static"]
-      },
+      }
       "include": [
+        {"lq_entries": "trace-scaled", "sq_entries": "trace-scaled"},
         {"lq_entries": "trace-scaled-strict", "sq_entries": "trace-scaled-strict"},
-        {"lq_entries": "trace-scaled-history", "sq_entries": "trace-scaled-history"}
+        {"lq_entries": "trace-scaled-history", "sq_entries": "trace-scaled-history"},
+        {"lq_entries": "trace-scaled-non-history", "sq_entries": "trace-scaled-non-history"},
       ]
     }
   ]
