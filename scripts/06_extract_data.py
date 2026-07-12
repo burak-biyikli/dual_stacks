@@ -8,6 +8,7 @@ import argparse
 import csv
 import json
 import sys
+import math
 from pathlib import Path
 
 # Module-level paths
@@ -191,6 +192,7 @@ def main():
     all_headers = metadata_headers + stat_headers
 
     csv_out_path = sim_dir / "consolidated_results.csv"
+    results = []
 
     with csv_out_path.open('w', newline='') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=all_headers)
@@ -199,17 +201,102 @@ def main():
         valid_runs = 0
         for run in runs:
             row_data = {key: run.get(key, "") for key in metadata_headers}
+            
+            # Ensure essential fields for compute_summary exist
+            row_data["profile"] = run.get("profile", "")
+            row_data["config_label"] = run.get("config_label", "")
+            row_data["status"] = run.get("status", "")
 
             stats_txt = Path(run["outdir"]) / "stats.txt"
             extracted_stats = parse_stats_file(stats_txt)
             row_data.update(extracted_stats)
 
             writer.writerow(row_data)
+            results.append(row_data)
             valid_runs += 1
 
     print(f"Successfully extracted data for {valid_runs} runs.")
     print(f"Consolidated CSV saved to: {csv_out_path}")
+    
+    compute_summary(results, sim_dir)
     return 0
+
+def compute_summary(results: list[dict], output_dir: Path) -> None:
+    """Compute per-config aggregates and write summary CSV."""
+    by_config: dict[str, list[dict]] = {}
+    for r in results:
+        by_config.setdefault(r["config_label"], []).append(r)
+
+    stock_ipc: dict[str, float] = {}
+    for r in results:
+        if r["config_label"] == "stock":
+            ipc = r.get("IPC")
+            if ipc != "" and ipc is not None and float(ipc) > 0:
+                stock_ipc[r["profile"]] = float(ipc)
+
+    summary_rows = []
+    for label, runs in by_config.items():
+        ipcs = []
+        accs = []
+        coverages = []
+        speedups = []
+        
+        for r in runs:
+            ipc_val = r.get("IPC")
+            if ipc_val != "" and ipc_val is not None:
+                ipc_float = float(ipc_val)
+                if ipc_float > 0:
+                    ipcs.append(ipc_float)
+                    sipc = stock_ipc.get(r["profile"])
+                    if sipc:
+                        speedups.append(ipc_float / sipc)
+            
+            acc_val = r.get("VP Accuracy")
+            if acc_val != "" and acc_val is not None:
+                acc_float = float(acc_val)
+                if acc_float >= 0:
+                    accs.append(acc_float)
+                    
+            cov_val = r.get("VP Coverage")
+            if cov_val != "" and cov_val is not None:
+                cov_float = float(cov_val)
+                if cov_float >= 0:
+                    coverages.append(cov_float)
+
+        row = {
+            "config_label": label,
+            "n_workloads": len(ipcs),
+            "mean_ipc": sum(ipcs) / len(ipcs) if ipcs else 0.0,
+            "geomean_ipc": math.exp(sum(math.log(x) for x in ipcs) / len(ipcs)) if ipcs else 0.0,
+            "mean_speedup": sum(speedups) / len(speedups) if speedups else 0.0,
+            "geomean_speedup": math.exp(sum(math.log(x) for x in speedups) / len(speedups)) if speedups else 0.0,
+            "mean_accuracy": sum(accs) / len(accs) if accs else 0.0,
+            "mean_coverage": sum(coverages) / len(coverages) if coverages else 0.0,
+            "n_finished": sum(1 for r in runs if r.get("status") == "finished"),
+            "n_failed": sum(1 for r in runs if r.get("status") != "finished"),
+        }
+        summary_rows.append(row)
+
+    summary_rows.sort(key=lambda r: r["geomean_speedup"], reverse=True)
+
+    summary_path = output_dir / "sweep_summary.csv"
+    fields = list(summary_rows[0].keys()) if summary_rows else []
+    with summary_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    print(f"\n{'='*94}")
+    print(f"MRP SWEEP SUMMARY — Top configurations by geomean speedup vs stock")
+    print(f"{'='*94}")
+    print(f"{'Config':<35} {'GeoSpeedup':>10} {'MeanSpeedup':>11} {'GeoIPC':>8} {'MeanIPC':>8} {'Accuracy':>8} {'Coverage':>8}")
+    print(f"{'-'*35} {'-'*10} {'-'*11} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+    for row in summary_rows[:25]:
+        print(f"{row['config_label']:<35} {row['geomean_speedup']:>10.4f} {row['mean_speedup']:>11.4f} "
+              f"{row['geomean_ipc']:>8.4f} {row['mean_ipc']:>8.4f} "
+              f"{row['mean_accuracy']:>8.4f} {row['mean_coverage']:>8.4f}")
+
+    print(f"\nFull summary: {summary_path}")
 
 if __name__ == "__main__":
     sys.exit(main())

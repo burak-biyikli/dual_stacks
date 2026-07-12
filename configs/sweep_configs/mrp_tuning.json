@@ -1,0 +1,39 @@
+{
+  "globals": {
+    "gem5_config": "single",
+    "num_cores": 1,
+    "max_insts": 1000000,
+    "threads": 1,
+    "lq_entries": 72,
+    "sq_entries": 56,
+    "lsu_ports": "2:1",
+    "physreg": 180
+  },
+  "experiments": [
+    {
+      "name": "mr_2bit_variants",
+      "matrix": {
+        "mr_mode": ["full"],
+        "mrp_log_max_confidence": [2],
+        "mrp_prediction_threshold": [3],
+        "mrp_allocation_confidence": [1, 2],
+        "mrp_demotion_penalty": [1, 2],
+        "mrp_realloc_penalty": [1]
+      }
+    },
+    {
+      "name": "mr_3bit_paired",
+      "matrix": {
+        "mr_mode": ["full"],
+        "mrp_log_max_confidence": [3],
+        "mrp_prediction_threshold": [7],
+        "mrp_allocation_confidence": [3, 4, 5]
+      },
+      "include": [
+        {"mrp_demotion_penalty": 3, "mrp_realloc_penalty": 3},
+        {"mrp_demotion_penalty": 4, "mrp_realloc_penalty": 4},
+        {"mrp_demotion_penalty": 5, "mrp_realloc_penalty": 5}
+      ]
+    }
+  ]
+}

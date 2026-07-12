@@ -1,0 +1,30 @@
+{
+  "globals": {
+    "gem5_config": "single",
+    "num_cores": 1,
+    "max_insts": 1000000,
+    "threads": 1,
+    "lq_entries": 72,
+    "sq_entries": 56,
+    "lsu_ports": "2:1",
+    "physreg": 180
+  },
+  "experiments": [
+    {
+      "name": "baseline_sweep",
+      "matrix": {
+        "mr_mode": ["off"],
+        "physreg": [100, 150, 180, 200],
+        "lsu_ports": ["1:1", "2:1", "3:2"]
+      }
+    },
+    {
+      "name": "mr_baselines",
+      "matrix": {
+        "mr_mode": ["static", "full"],
+        "physreg": [180],
+        "lsu_ports": ["2:1"]
+      }
+    }
+  ]
+}
