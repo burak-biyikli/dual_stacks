@@ -31,9 +31,12 @@ TARGET_STATS = {
     "system.cpu.commitStats0.numStoreInsts": "Committed Stores",
 
     # Predictor / Memory Renaming Unit
-    "system.cpu.valuePred.VPsupported": "VP Supported",
-    "system.cpu.valuePred.VPpredicted": "VP Predicted",
-    "system.cpu.valuePred.VPcorrect": "VP Correct",
+    "system.cpu.valuePred.VPRenameSupported": "VP Supported",
+    "system.cpu.valuePred.VPRenamePredicted": "VP Predicted",
+    "system.cpu.valuePred.VPCorrect": "VP Correct",
+    "system.cpu.valuePred.VPMispredict": "VP Mispredict",
+    "system.cpu.valuePred.VPMissedOpportunity": "VP Missed Opportunity",
+    "system.cpu.valuePred.VPCorrectReject": "VP Correct Reject",
     "system.cpu.valuePred.VPaccuracy": "VP Accuracy",
     "system.cpu.valuePred.VPcoverage": "VP Coverage",
 

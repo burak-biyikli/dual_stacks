@@ -146,7 +146,7 @@ index 192f73da2e..8bce754d46 100644
  
  /** Struct that defines all backwards communication. */
 diff --git a/src/cpu/o3/commit.cc b/src/cpu/o3/commit.cc
-index 405ea09d64..1c391a977a 100644
+index 405ea09d64..b65dd22d4f 100644
 --- a/src/cpu/o3/commit.cc
 +++ b/src/cpu/o3/commit.cc
 @@ -63,6 +63,7 @@
@@ -167,7 +167,40 @@ index 405ea09d64..1c391a977a 100644
  {
      if (commitWidth > MaxWidth)
          fatal("commitWidth (%d) is larger than compiled limit (%d),\n"
-@@ -794,6 +796,11 @@ Commit::commit()
+@@ -315,6 +317,7 @@ Commit::clearStates(ThreadID tid)
+     tcSquash[tid] = false;
+     pc[tid].reset(cpu->tcBase(tid)->getIsaPtr()->newPCState());
+     lastCommitedSeqNum[tid] = 0;
++    pendingVPMispredicts[tid].clear();
+     squashAfterInst[tid] = NULL;
+ 
+     // Clear out any of this thread's instructions being sent to prior stages.
+@@ -502,6 +505,7 @@ Commit::generateTCEvent(ThreadID tid)
+ void
+ Commit::squashAll(ThreadID tid)
+ {
++    pendingVPMispredicts[tid].clear();
+     // If we want to include the squashing instruction in the squash,
+     // then use one older sequence number.
+     // Hopefully this doesn't mess things up.  Basically I want to squash
+@@ -787,6 +791,16 @@ Commit::commit()
+             commitStatus[tid] != TrapPending &&
+             fromIEW->squashedSeqNum[tid] <= youngestSeqNum[tid]) {
+ 
++            // Clear any pending value mispredicts that are squashed
++            auto &pending = pendingVPMispredicts[tid];
++            for (auto it = pending.begin(); it != pending.end(); ) {
++                if (*it > fromIEW->squashedSeqNum[tid]) {
++                    it = pending.erase(it);
++                } else {
++                    ++it;
++                }
++            }
++
+             if (fromIEW->mispredictInst[tid]) {
+                 DPRINTF(Commit,
+                     "[tid:%i] Squashing due to branch mispred "
+@@ -794,6 +808,18 @@ Commit::commit()
                      tid,
                      fromIEW->mispredictInst[tid]->pcState().instAddr(),
                      fromIEW->squashedSeqNum[tid]);
@@ -176,13 +209,30 @@ index 405ea09d64..1c391a977a 100644
 +                    "[tid:%i] Squashing due to value prediction error [sn:%llu]\n",
 +                    tid, fromIEW->squashedSeqNum[tid]);
 +                set(pc[tid], fromIEW->pc[tid]);
++                if (lastCommitedSeqNum[tid] >= fromIEW->squashedSeqNum[tid] - 1) {
++                    if (valuePred) {
++                        valuePred->stats.VPMispredict++;
++                    }
++                } else {
++                    pendingVPMispredicts[tid].insert(fromIEW->squashedSeqNum[tid]);
++                }
              } else {
                  DPRINTF(Commit,
                      "[tid:%i] Squashing due to order violation [sn:%llu]\n",
-@@ -1037,6 +1044,38 @@ Commit::commitInsts()
+@@ -1037,6 +1063,54 @@ Commit::commitInsts()
                  // Keep track of the last sequence number commited
                  lastCommitedSeqNum[tid] = head_inst->seqNum;
  
++                // Check if the instruction preceding a squashed value-predicted load commits.
++                // If so, the load was on the correct execution path.
++                auto it = pendingVPMispredicts[tid].find(head_inst->seqNum + 1);
++                if (it != pendingVPMispredicts[tid].end()) {
++                    if (valuePred) {
++                        valuePred->stats.VPMispredict++;
++                    }
++                    pendingVPMispredicts[tid].erase(it);
++                }
++
 +                // Memory Renaming hooks
 +                if (valuePred) {
 +                    if (head_inst->isStore() && !head_inst->isSquashed()) {
@@ -210,7 +260,13 @@ index 405ea09d64..1c391a977a 100644
 +                        valuepred::VPFeedback feedback;
 +                        valuePred->update(updateInfo, head_inst->vpRecord.get(), feedback);
 +                        if (head_inst->vpResult.speculative && !head_inst->vpMisprediction) {
-+                            valuePred->stats.VPcorrect++;
++                            valuePred->stats.VPCorrect++;
++                        } else if (head_inst->vpResult.speculative && head_inst->vpMisprediction) {
++                            valuePred->stats.VPMispredict++;
++                        } else if (!head_inst->vpResult.speculative && feedback.forwardingOpportunity) {
++                            valuePred->stats.VPMissedOpportunity++;
++                        } else {
++                            valuePred->stats.VPCorrectReject++;
 +                        }
 +                    }
 +                }
@@ -219,10 +275,18 @@ index 405ea09d64..1c391a977a 100644
                  // others squash everything and restart fetch
                  if (head_inst->isSquashAfter())
 diff --git a/src/cpu/o3/commit.hh b/src/cpu/o3/commit.hh
-index 5f978c8c5d..febda9f3fc 100644
+index 5f978c8c5d..1245efbbf5 100644
 --- a/src/cpu/o3/commit.hh
 +++ b/src/cpu/o3/commit.hh
-@@ -52,6 +52,7 @@
+@@ -42,6 +42,7 @@
+ #define __CPU_O3_COMMIT_HH__
+ 
+ #include <queue>
++#include <set>
+ 
+ #include "base/statistics.hh"
+ #include "cpu/exetrace.hh"
+@@ -52,6 +53,7 @@
  #include "cpu/o3/limits.hh"
  #include "cpu/o3/rename_map.hh"
  #include "cpu/o3/rob.hh"
@@ -230,11 +294,17 @@ index 5f978c8c5d..febda9f3fc 100644
  #include "cpu/timebuf.hh"
  #include "enums/CommitPolicy.hh"
  #include "sim/probe/probe.hh"
-@@ -446,6 +447,8 @@ class Commit
+@@ -446,6 +448,14 @@ class Commit
      /** Rename map interface. */
      UnifiedRenameMap *renameMap[MaxThreads];
  
 +    valuepred::VPUnit *valuePred;
++
++    /** Sequence numbers of instructions that had value prediction errors.
++     * We only increment VPMispredict when the instruction immediately preceding
++     * them commits, ensuring they were on the correct path.
++     */
++    std::set<InstSeqNum> pendingVPMispredicts[MaxThreads];
 +
      /** True if last committed microop can be followed by an interrupt */
      bool canHandleInterrupts;
@@ -835,10 +905,10 @@ index 0000000000..25aa51554c
 +
 diff --git a/src/cpu/valuepred/ValuePredictor.py b/src/cpu/valuepred/ValuePredictor.py
 new file mode 100644
-index 0000000000..85f9a2e926
+index 0000000000..9eaa9ec4f7
 --- /dev/null
 +++ b/src/cpu/valuepred/ValuePredictor.py
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,45 @@
 +from m5.params import *
 +from m5.proxy import *
 +from m5.SimObject import *
@@ -860,17 +930,25 @@ index 0000000000..85f9a2e926
 +    abstract = False
 +
 +    # Configurable MRP structure sizes
-+    ways = Param.Int(4, "ways of the store-load cache / MRP")
++
++    #Size of the MRP
++    ways = Param.Int(8, "ways of the store-load cache / MRP")
 +    tagWidth = Param.Int(16, "tag-width")
 +    logESTBEntrys = Param.Int(10, "log 2 of store-load cache / MRP sets (10 -> 1024 sets)")
++
++    # MRP tuneables
 +    logMaxConfidence = Param.Int(2, "log 2 of max confidence number (2 -> 0..3)")
 +    predictionThreshold = Param.Int(3, "threshold of confidence to enable prediction")
 +    allocationConfidence = Param.Int(1, "starting confidence when a new MRP entry is allocated")
 +    reallocationIsPenalty = Param.Bool(True, "If true, subtract reallocationAmount on PC change. If false, reinitialize confidence to reallocationAmount.")
 +    reallocationAmount = Param.Int(1, "Amount to reinitialize to, or penalize by, on a producer change")
 +    demotionPenalty = Param.Int(1, "Demotion penalty for wrong prediction or missing store")
++
++    #Size of the MRT
 +    mrtQueueCapacity = Param.Int(8, "Capacity of each circular queue in the MRT")
 +    mrtTableCapacity = Param.Int(1024, "Maximum number of Store PCs tracked in the MRT")
++
++    #Size of the RS-FIFO
 +    committedStoreQueueCapacity = Param.Int(512, "Depth of the retired store FIFO (RS-FIFO) used for commit-time overlap detection")
 +
 +    # Path enables
@@ -878,10 +956,10 @@ index 0000000000..85f9a2e926
 +    enableStatic = Param.Bool(True, "Enable static Memory Renaming path (SRP)")
 diff --git a/src/cpu/valuepred/memory_renaming.cc b/src/cpu/valuepred/memory_renaming.cc
 new file mode 100644
-index 0000000000..bf9bf29f9d
+index 0000000000..d5e7dcb6ed
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.cc
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,290 @@
 +#include "cpu/valuepred/memory_renaming.hh"
 +
 +#include <algorithm>
@@ -1017,14 +1095,14 @@ index 0000000000..bf9bf29f9d
 +    PhysRegIdPtr stPhysReg = nullptr;
 +    bool dataReady = false;
 +
-+    stats.VPsupported++;
++    stats.VPRenameSupported++;
 +
 +    bool hit = core.matchLoad(loadPC, loadSize, tid, inst->seqNum, isPop, isPeek, disp,
 +                              speculative, predictedVal, stPhysReg, dataReady);
 +
 +    if (hit) {
 +        inst->vpResult.speculative = true;
-+        stats.VPpredicted++;
++        stats.VPRenamePredicted++;
 +        if (dataReady) {
 +            inst->vpResult.value = predictedVal;
 +            inst->vpResult.dataReady = true;
@@ -1054,11 +1132,12 @@ index 0000000000..bf9bf29f9d
 +void
 +MemoryRenaming::update(const VPUpdateInfo &updateInfo,
 +                      const VPPredictionRecord *record,
-+                      const VPFeedback &feedback)
++                      VPFeedback &feedback)
 +{
 +    Addr loadPC = updateInfo.pc;
 +
 +    if (auto *producerInfo = updateInfo.getExt<ProducerInfoExt>()) {
++        feedback.forwardingOpportunity = true;
 +        Addr storePC = producerInfo->producerStorePC;
 +        InstSeqNum storeSeqNum = producerInfo->producerStoreSeqNum;
 +
@@ -1074,6 +1153,7 @@ index 0000000000..bf9bf29f9d
 +                                              updateInfo.accessSize,
 +                                              updateInfo.seqNo);
 +        if (match.found) {
++            feedback.forwardingOpportunity = true;
 +            int offset = core.getProducerOffset(match.storeSeqNum, match.storePC);
 +            if (offset >= 0) {
 +                core.trainMRP(loadPC, match.storePC, offset, true);
@@ -1172,7 +1252,7 @@ index 0000000000..bf9bf29f9d
 +} // namespace gem5
 diff --git a/src/cpu/valuepred/memory_renaming.hh b/src/cpu/valuepred/memory_renaming.hh
 new file mode 100644
-index 0000000000..ba924818c5
+index 0000000000..a248418dcb
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.hh
 @@ -0,0 +1,77 @@
@@ -1229,7 +1309,7 @@ index 0000000000..ba924818c5
 +    // VPUnit standard interfaces
 +    VPPredictionCandidate predict(const VPPredictRequest &request) override;
 +    void update(const VPUpdateInfo &updateInfo, const VPPredictionRecord *record,
-+                const VPFeedback &feedback) override;
++                VPFeedback &feedback) override;
 +    void specUpdate(const VPSpecUpdateInfo &specUpdateInfo) override;
 +    void squash(ThreadID tid, const uint64_t seq_no) override;
 +    void writebackReg(PhysRegIdPtr physReg, RegVal val) override;
@@ -2065,10 +2145,10 @@ index 0000000000..0dbdba77e4
 +
 diff --git a/src/cpu/valuepred/memory_renaming_commit_pipeline.test.cc b/src/cpu/valuepred/memory_renaming_commit_pipeline.test.cc
 new file mode 100644
-index 0000000000..3f83af734d
+index 0000000000..d40b59a71d
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_commit_pipeline.test.cc
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,238 @@
 +#include <gtest/gtest.h>
 +
 +#include "cpu/valuepred/memory_renaming_pipeline_harness.hh"
@@ -2225,6 +2305,26 @@ index 0000000000..3f83af734d
 +
 +    commit->commitLoad(0x3000, 14, false, 0, 0, true, true);
 +    EXPECT_EQ(commit->vpCorrect, 1u);
++}
++
++TEST_F(CommitPipelineTest, MispredictionIncrementsVPMispredict)
++{
++    commit->commitStore(0x2000, 10);
++    commit->commitLoad(0x3000, 12, true, 0x2000, 10, true, true);
++    EXPECT_EQ(commit->vpMispredict, 1u);
++}
++
++TEST_F(CommitPipelineTest, MissedOpportunityIncrementsVPMissedOpportunity)
++{
++    commit->commitStore(0x2000, 10);
++    commit->commitLoad(0x3000, 12, true, 0x2000, 10, false, false);
++    EXPECT_EQ(commit->vpMissedOpportunity, 1u);
++}
++
++TEST_F(CommitPipelineTest, CorrectRejectIncrementsVPCorrectReject)
++{
++    commit->commitLoad(0x3000, 12, false, 0, 0, false, false);
++    EXPECT_EQ(commit->vpCorrectReject, 1u);
 +}
 +
 +TEST_F(CommitPipelineTest, MispredictionSquashDeferredUntilBoundary)
@@ -3042,10 +3142,10 @@ index 0000000000..26292c2884
 +#endif // __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 diff --git a/src/cpu/valuepred/memory_renaming_pipeline_harness.hh b/src/cpu/valuepred/memory_renaming_pipeline_harness.hh
 new file mode 100644
-index 0000000000..db774bfc79
+index 0000000000..6280eed4ba
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_pipeline_harness.hh
-@@ -0,0 +1,335 @@
+@@ -0,0 +1,354 @@
 +#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_PIPELINE_HARNESS_HH__
 +#define __CPU_VALUEPRED_MEMORY_RENAMING_PIPELINE_HARNESS_HH__
 +
@@ -3277,6 +3377,9 @@ index 0000000000..db774bfc79
 +    ThreadID tid = 0;
 +
 +    uint64_t vpCorrect = 0;
++    uint64_t vpMispredict = 0;
++    uint64_t vpMissedOpportunity = 0;
++    uint64_t vpCorrectReject = 0;
 +
 +    struct LoadCommitResult
 +    {
@@ -3340,8 +3443,24 @@ index 0000000000..db774bfc79
 +
 +        core.retireSRP(tid, loadSeqNum);
 +
++        bool forwardingOpportunity = false;
++        if (hasProducer) {
++            forwardingOpportunity = true;
++        } else {
++            auto match = core.findForwardingStore(loadPhysAddr, loadSize, loadSeqNum);
++            if (match.found) {
++                forwardingOpportunity = true;
++            }
++        }
++
 +        if (vpSpeculative && !vpMisprediction) {
 +            vpCorrect++;
++        } else if (vpSpeculative && vpMisprediction) {
++            vpMispredict++;
++        } else if (!vpSpeculative && forwardingOpportunity) {
++            vpMissedOpportunity++;
++        } else {
++            vpCorrectReject++;
 +        }
 +
 +        if (vpMisprediction) {
@@ -3558,10 +3677,10 @@ index 0000000000..40e43c9344
 +}
 diff --git a/src/cpu/valuepred/valuepred_metadata.hh b/src/cpu/valuepred/valuepred_metadata.hh
 new file mode 100644
-index 0000000000..69f93dd116
+index 0000000000..1122a7d0c3
 --- /dev/null
 +++ b/src/cpu/valuepred/valuepred_metadata.hh
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,210 @@
 +#ifndef __VALUEPRED_METADATA_HH_
 +#define __VALUEPRED_METADATA_HH_
 +
@@ -3764,6 +3883,7 @@ index 0000000000..69f93dd116
 +    bool offeredPrediction = false;
 +    RegVal predictedValue = 0;
 +    bool wouldHaveBeenCorrect = false;
++    bool forwardingOpportunity = false;
 +};
 +
 +}
@@ -3773,10 +3893,10 @@ index 0000000000..69f93dd116
 +#endif
 diff --git a/src/cpu/valuepred/valuepred_unit.cc b/src/cpu/valuepred/valuepred_unit.cc
 new file mode 100644
-index 0000000000..8bab27145d
+index 0000000000..cfdb39acec
 --- /dev/null
 +++ b/src/cpu/valuepred/valuepred_unit.cc
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,68 @@
 +#include "cpu/valuepred/valuepred_unit.hh"
 +
 +#include <utility>
@@ -3810,23 +3930,35 @@ index 0000000000..8bab27145d
 +VPUnit::valuePredict(const VPPredictRequest &request,
 +        std::unique_ptr<VPPredictionRecord> &record)
 +{
-+    stats.VPsupported++;
++    stats.VPRenameSupported++;
 +    auto candidate = predict(request);
 +    record = std::move(candidate.record);
 +    if (candidate.result.speculative) {
-+        stats.VPpredicted++;
++        stats.VPRenamePredicted++;
 +    }
 +    return candidate.result;
 +}
 +
 +VPUnit::ValuePredUnitStats::ValuePredUnitStats(VPUnit *vp)
 +    : statistics::Group(vp),
-+      ADD_STAT(VPcorrect, statistics::units::Count::get(), "number of correct vp"),
-+      ADD_STAT(VPpredicted, statistics::units::Count::get(), "number of predicted vp"),
-+      ADD_STAT(VPaccuracy, statistics::units::Ratio::get(), "the accuracy of value predictor",
-+               VPcorrect / VPpredicted),
-+      ADD_STAT(VPsupported, statistics::units::Count::get(), "number of vp support"),
-+      ADD_STAT(VPcoverage, statistics::units::Ratio::get(), "the coverage of vp", VPcorrect / VPsupported)
++      ADD_STAT(VPRenameSupported, statistics::units::Count::get(),
++               "number of loads eligible for value prediction at rename"),
++      ADD_STAT(VPRenamePredicted, statistics::units::Count::get(),
++               "number of speculative predictions made at rename"),
++      ADD_STAT(VPCorrect, statistics::units::Count::get(),
++               "number of correct predictions on committed instructions (TP)"),
++      ADD_STAT(VPMispredict, statistics::units::Count::get(),
++               "number of mispredicted values on committed instructions (FP)"),
++      ADD_STAT(VPMissedOpportunity, statistics::units::Count::get(),
++               "number of missed forwarding opportunities (FN)"),
++      ADD_STAT(VPCorrectReject, statistics::units::Count::get(),
++               "number of correct rejections (TN)"),
++      ADD_STAT(VPaccuracy, statistics::units::Ratio::get(),
++               "prediction accuracy (precision)",
++               VPCorrect / (VPCorrect + VPMispredict)),
++      ADD_STAT(VPcoverage, statistics::units::Ratio::get(),
++               "prediction coverage (recall)",
++               VPCorrect / (VPCorrect + VPMissedOpportunity))
 +{
 +}
 +
@@ -3835,10 +3967,10 @@ index 0000000000..8bab27145d
 +}
 diff --git a/src/cpu/valuepred/valuepred_unit.hh b/src/cpu/valuepred/valuepred_unit.hh
 new file mode 100644
-index 0000000000..a281f739c0
+index 0000000000..7c69f4f3cd
 --- /dev/null
 +++ b/src/cpu/valuepred/valuepred_unit.hh
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,83 @@
 +#ifndef __VALUEPRED_UNIT_HH__
 +#define __VALUEPRED_UNIT_HH__
 +
@@ -3883,7 +4015,7 @@ index 0000000000..a281f739c0
 +
 +    // In commit time, update value predictor
 +    virtual void update(const VPUpdateInfo &updateInfo,
-+            const VPPredictionRecord *record, const VPFeedback &feedback) = 0;
++            const VPPredictionRecord *record, VPFeedback &feedback) = 0;
 +
 +    // Some value predictor need speculative update to support back-to-back predict.
 +    virtual void specUpdate(const VPSpecUpdateInfo &specUpdateInfo) = 0;
@@ -3902,10 +4034,16 @@ index 0000000000..a281f739c0
 +    {
 +        ValuePredUnitStats(VPUnit *vp);
 +
-+        statistics::Scalar VPcorrect;
-+        statistics::Scalar VPpredicted;
++        // Rename-time (speculative) statistics
++        statistics::Scalar VPRenameSupported;
++        statistics::Scalar VPRenamePredicted;
++
++        // Commit-time (architectural) confusion matrix
++        statistics::Scalar VPCorrect;
++        statistics::Scalar VPMispredict;
++        statistics::Scalar VPMissedOpportunity;
++        statistics::Scalar VPCorrectReject;
 +        statistics::Formula VPaccuracy;
-+        statistics::Scalar VPsupported;
 +        statistics::Formula VPcoverage;
 +
 +    } stats;

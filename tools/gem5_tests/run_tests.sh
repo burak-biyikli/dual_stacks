@@ -3,9 +3,25 @@ set -e
 
 # --- Argument Parsing ---
 VERBOSE=0
-if [[ "$1" == "-v" || "$1" == "--verbose" ]]; then
-    VERBOSE=1
-fi
+QUICK=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -v|--verbose)
+            VERBOSE=1
+            shift
+            ;;
+        -q|--quick)
+            QUICK=1
+            shift
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            echo "Usage: $0 [-v|--verbose] [-q|--quick]"
+            exit 1
+            ;;
+    esac
+done
 
 set -u
 
@@ -120,8 +136,8 @@ for test_dir in */; do
                 # 3. Check Stats
                 stats_failed=0
                 "$SCRIPT_DIR/check_stats.py" "stock" "$test_name" "$out_dir/stats_stock.txt" || stats_failed=1
-                "$SCRIPT_DIR/check_stats.py" "mr" "$test_name" "$out_dir/stats_mr_penalty.txt" || stats_failed=1
-                "$SCRIPT_DIR/check_stats.py" "mr" "$test_name" "$out_dir/stats_mr_reinit.txt" || stats_failed=1
+                "$SCRIPT_DIR/check_stats.py" "mr_penalty" "$test_name" "$out_dir/stats_mr_penalty.txt" "$out_dir/stats_stock.txt" || stats_failed=1
+                "$SCRIPT_DIR/check_stats.py" "mr_reinit" "$test_name" "$out_dir/stats_mr_reinit.txt" "$out_dir/stats_stock.txt" || stats_failed=1
                 
                 if [ $stats_failed -eq 1 ]; then
                     FAILURES=$((FAILURES + 1))
@@ -168,6 +184,21 @@ for test_dir in */; do
         done
     fi
 done
+
+if [ "$QUICK" -eq 1 ]; then
+    echo -e "\n=== Skipping Macrobenchmarks (Quick Mode) ==="
+    if [ $FAILURES -gt 0 ]; then
+        echo -e "\n\n==========================================="
+        echo "Test Summary: FAILED. $FAILURES test(s) failed."
+        echo "==========================================="
+        exit 1
+    else
+        echo -e "\n\n==========================================="
+        echo "Test Summary: SUCCESS. All tests passed."
+        echo "==========================================="
+        exit 0
+    fi
+fi
 
 # --- Macrobenchmark Hybrid Testing Loop ---
 echo -e "\n=== Running gem5 Macrobenchmarks (Hybrid Mode) ==="

@@ -44,6 +44,13 @@ def add_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--store-ports", type=int, default=BASELINE["store_ports"])
     parser.add_argument("--max-insts", type=int, default=1_000_000)
     parser.add_argument("--num-cores", type=int, default=1)
+    # MRP confidence tuning knobs (only used when --mr-mode != off)
+    parser.add_argument("--log-max-confidence", type=int, default=None, help="log2 of max confidence (2 -> 0..3, 3 -> 0..7)")
+    parser.add_argument("--prediction-threshold", type=int, default=None, help="confidence threshold to enable prediction")
+    parser.add_argument("--allocation-confidence", type=int, default=None, help="starting confidence on new MRP entry allocation")
+    parser.add_argument("--realloc-penalty", type=int, default=None, help="if set, enables penalty mode with this amount")
+    parser.add_argument("--realloc-reinit", type=int, default=None, help="if set, enables reinit mode with this amount")
+    parser.add_argument("--demotion-penalty", type=int, default=None, help="confidence penalty on misprediction")
     parser.add_argument("program", help="SE workload executable")
     parser.add_argument("program_args", nargs=argparse.REMAINDER)
 
@@ -124,8 +131,24 @@ def configure_cpu(cpu, args) -> None:
         predictor = MemoryRenaming()
         predictor.enableStatic = True
         predictor.enableDynamic = args.mr_mode == "full"
-        predictor.reallocationIsPenalty = True
-        predictor.reallocationAmount = 1
+        # Apply MRP tuning knobs if provided, otherwise use SimObject defaults
+        if args.log_max_confidence is not None:
+            predictor.logMaxConfidence = args.log_max_confidence
+        if args.prediction_threshold is not None:
+            predictor.predictionThreshold = args.prediction_threshold
+        if args.allocation_confidence is not None:
+            predictor.allocationConfidence = args.allocation_confidence
+        if args.realloc_penalty is not None:
+            predictor.reallocationIsPenalty = True
+            predictor.reallocationAmount = args.realloc_penalty
+        elif args.realloc_reinit is not None:
+            predictor.reallocationIsPenalty = False
+            predictor.reallocationAmount = args.realloc_reinit
+        else:
+            predictor.reallocationIsPenalty = True
+            predictor.reallocationAmount = 1
+        if args.demotion_penalty is not None:
+            predictor.demotionPenalty = args.demotion_penalty
         cpu.valuePred = predictor
 
 
