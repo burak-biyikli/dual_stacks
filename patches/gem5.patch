@@ -478,7 +478,7 @@ index f0c14fb177..df5a3042b5 100644
  
  } // namespace o3
 diff --git a/src/cpu/o3/iew.cc b/src/cpu/o3/iew.cc
-index d5be814468..93c857a796 100644
+index d5be814468..402f216088 100644
 --- a/src/cpu/o3/iew.cc
 +++ b/src/cpu/o3/iew.cc
 @@ -44,6 +44,7 @@
@@ -599,7 +599,7 @@ index d5be814468..93c857a796 100644
                              inst->renamedDestIdx(i)->index(),
                              inst->renamedDestIdx(i)->className());
                      scoreboard->setReg(inst->renamedDestIdx(i));
-+                    if (valuePred && inst->renamedDestIdx(i)->is(IntRegClass)) {
++                    if (valuePred && (inst->renamedDestIdx(i)->is(IntRegClass) || inst->renamedDestIdx(i)->is(FloatRegClass))) {
 +                        RegVal val = cpu->getReg(inst->renamedDestIdx(i), inst->threadNumber);
 +                        valuePred->writebackReg(inst->renamedDestIdx(i), val);
 +                    }
@@ -956,10 +956,10 @@ index 0000000000..9eaa9ec4f7
 +    enableStatic = Param.Bool(True, "Enable static Memory Renaming path (SRP)")
 diff --git a/src/cpu/valuepred/memory_renaming.cc b/src/cpu/valuepred/memory_renaming.cc
 new file mode 100644
-index 0000000000..d5e7dcb6ed
+index 0000000000..e03a1d9718
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.cc
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,298 @@
 +#include "cpu/valuepred/memory_renaming.hh"
 +
 +#include <algorithm>
@@ -1115,6 +1115,7 @@ index 0000000000..d5e7dcb6ed
 +                    ld_physreg ? ld_physreg->flatIndex() : -1);
 +        } else {
 +            inst->vpResult.dataReady = false;
++            inst->vpResult.producerPhysReg = stPhysReg->flatIndex();
 +            pendingLoads[stPhysReg->flatIndex()].push_back(inst);
 +            DPRINTF(MemoryRenaming, "Rename LD [sn:%lu] PC %lx Match: Pending on st_physreg %s (flat:%d)\n",
 +                    inst->seqNum, loadPC, stPhysReg ? stPhysReg->className() : "null",
@@ -1227,8 +1228,12 @@ index 0000000000..d5e7dcb6ed
 +{
 +    DPRINTF(MemoryRenaming, "completeLoadLSU: attempting to remove LD [sn:%lu] PC %lx\n",
 +            inst->seqNum, inst->pcState().instAddr());
-+    for (auto &pair : pendingLoads) {
-+        auto &list = pair.second;
++    if (!inst->vpResult.speculative) {
++        return;
++    }
++    auto it = pendingLoads.find(inst->vpResult.producerPhysReg);
++    if (it != pendingLoads.end()) {
++        auto &list = it->second;
 +        auto initial_size = list.size();
 +        list.erase(
 +            std::remove_if(list.begin(), list.end(),
@@ -1236,7 +1241,10 @@ index 0000000000..d5e7dcb6ed
 +            list.end());
 +        if (list.size() < initial_size) {
 +            DPRINTF(MemoryRenaming, "completeLoadLSU: removed LD [sn:%lu] from pendingLoads flatIndex %d\n",
-+                    inst->seqNum, pair.first);
++                    inst->seqNum, it->first);
++        }
++        if (list.empty()) {
++            pendingLoads.erase(it);
 +        }
 +    }
 +}
@@ -1335,10 +1343,10 @@ index 0000000000..a248418dcb
 +#endif // __CPU_VALUEPRED_MEMORY_RENAMING_HH__
 diff --git a/src/cpu/valuepred/memory_renaming.test.cc b/src/cpu/valuepred/memory_renaming.test.cc
 new file mode 100644
-index 0000000000..0dbdba77e4
+index 0000000000..65112447c4
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming.test.cc
-@@ -0,0 +1,804 @@
+@@ -0,0 +1,849 @@
 +#include <gtest/gtest.h>
 +#include <random>
 +#include <vector>
@@ -2143,6 +2151,51 @@ index 0000000000..0dbdba77e4
 +    delete core;
 +}
 +
++TEST_F(MemoryRenamingCoreTest, OptimizedSquashRollback)
++{
++    auto core = createDefaultCore();
++    ThreadID tid = 0;
++
++    // Inject stores across multiple PCs
++    Addr pc1 = 0x1000;
++    Addr pc2 = 0x2000;
++    Addr pc3 = 0x3000;
++
++    // pc1 has store at seq 10 (not squashed)
++    core->insertStore(pc1, 10, tid, 8, 5, true, 0x10);
++    // pc2 has store at seq 12 (not squashed)
++    core->insertStore(pc2, 12, tid, 8, 6, true, 0x12);
++    // pc3 has store at seq 15 (squashed)
++    core->insertStore(pc3, 15, tid, 8, 7, true, 0x15);
++    // pc1 has another store at seq 18 (squashed)
++    core->insertStore(pc1, 18, tid, 8, 8, true, 0x18);
++
++    // Verify activeStoreList has all 4 stores
++    EXPECT_EQ(core->activeStoreList.size(), 4);
++
++    // Squash everything younger than sequence number 13 (so seq 15 and 18 are squashed)
++    core->squash(tid, 13);
++
++    // Verify mrtTable for pc1 has rolled back to count 1, and the remaining store has seqNum 10
++    EXPECT_EQ(core->mrtTable[pc1].count, 1);
++    EXPECT_EQ(core->mrtTable[pc1].getAtOffset(0)->seqNum, 10);
++
++    // Verify mrtTable for pc2 is unmodified (count 1, seqNum 12)
++    EXPECT_EQ(core->mrtTable[pc2].count, 1);
++    EXPECT_EQ(core->mrtTable[pc2].getAtOffset(0)->seqNum, 12);
++
++    // Verify mrtTable for pc3 has rolled back to count 0 (since it only had seq 15 which was squashed)
++    EXPECT_EQ(core->mrtTable[pc3].count, 0);
++
++    // Verify activeStoreList only contains the remaining unsquashed stores (seq 10 and 12)
++    EXPECT_EQ(core->activeStoreList.size(), 2);
++    EXPECT_EQ(core->activeStoreList[0].seqNum, 10);
++    EXPECT_EQ(core->activeStoreList[1].seqNum, 12);
++
++    delete core;
++}
++
++
 diff --git a/src/cpu/valuepred/memory_renaming_commit_pipeline.test.cc b/src/cpu/valuepred/memory_renaming_commit_pipeline.test.cc
 new file mode 100644
 index 0000000000..d40b59a71d
@@ -2389,10 +2442,10 @@ index 0000000000..d40b59a71d
 +}
 diff --git a/src/cpu/valuepred/memory_renaming_core.hh b/src/cpu/valuepred/memory_renaming_core.hh
 new file mode 100644
-index 0000000000..26292c2884
+index 0000000000..a0e76f3cd5
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_core.hh
-@@ -0,0 +1,747 @@
+@@ -0,0 +1,741 @@
 +#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 +#define __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 +
@@ -3038,21 +3091,15 @@ index 0000000000..26292c2884
 +            }
 +        }
 +
-+        // Invalidate and roll back squashed stores in every MRT queue.
-+        for (auto &mrtPair : mrtTable) {
-+            auto &q = mrtPair.second;
-+            for (int i = 0; i < q.count; i++) {
-+                MRTEntry<RegIdType> *entry = q.getAtOffset(i);
-+                if (entry && entry->valid && entry->seqNum > seq_no) {
-+                    entry->valid = false;
-+                }
-+            }
-+            while (q.count > 0) {
-+                MRTEntry<RegIdType> *tail = q.getAtOffset(0);
-+                if (tail && tail->seqNum > seq_no) {
-+                    q.rollback(1);
-+                } else {
++        // Invalidate and roll back squashed stores in MRT queues by traversing the activeStoreList in reverse.
++        for (auto it = activeStoreList.rbegin(); it != activeStoreList.rend(); ++it) {
++            if (it->tid == tid) {
++                if (it->seqNum <= seq_no) {
 +                    break;
++                }
++                auto mrtIt = mrtTable.find(it->pc);
++                if (mrtIt != mrtTable.end()) {
++                    mrtIt->second.rollback(1);
 +                }
 +            }
 +        }
@@ -3142,10 +3189,10 @@ index 0000000000..26292c2884
 +#endif // __CPU_VALUEPRED_MEMORY_RENAMING_CORE_HH__
 diff --git a/src/cpu/valuepred/memory_renaming_pipeline_harness.hh b/src/cpu/valuepred/memory_renaming_pipeline_harness.hh
 new file mode 100644
-index 0000000000..6280eed4ba
+index 0000000000..2bd8f1538a
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_pipeline_harness.hh
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,377 @@
 +#ifndef __CPU_VALUEPRED_MEMORY_RENAMING_PIPELINE_HARNESS_HH__
 +#define __CPU_VALUEPRED_MEMORY_RENAMING_PIPELINE_HARNESS_HH__
 +
@@ -3218,6 +3265,7 @@ index 0000000000..6280eed4ba
 +        int ldPhysReg = -1;
 +        uint64_t predictedVal = 0;
 +        bool speculative = false;
++        int producerPhysReg = -1;
 +    };
 +    std::unordered_map<int, std::vector<PendingLoad>> pendingLoads;
 +
@@ -3274,6 +3322,7 @@ index 0000000000..6280eed4ba
 +            pending.loadSeq = seqNum;
 +            pending.ldPhysReg = ldPhysReg;
 +            pending.speculative = true;
++            pending.producerPhysReg = stReg;
 +            pendingLoads[stReg].push_back(pending);
 +
 +            LoadPrediction pred;
@@ -3306,16 +3355,37 @@ index 0000000000..6280eed4ba
 +        pendingLoads.erase(it);
 +    }
 +
-+    void completeLoadLSU(InstSeqNum loadSeq)
++    void completeLoadLSU(InstSeqNum loadSeq, int producerPhysReg = -1)
 +    {
-+        for (auto &pair : pendingLoads) {
-+            auto &list = pair.second;
-+            list.erase(
-+                std::remove_if(list.begin(), list.end(),
-+                               [loadSeq](const PendingLoad &l) {
-+                                   return l.loadSeq == loadSeq;
-+                               }),
-+                list.end());
++        if (producerPhysReg >= 0) {
++            auto it = pendingLoads.find(producerPhysReg);
++            if (it != pendingLoads.end()) {
++                auto &list = it->second;
++                list.erase(
++                    std::remove_if(list.begin(), list.end(),
++                                   [loadSeq](const PendingLoad &l) {
++                                       return l.loadSeq == loadSeq;
++                                   }),
++                    list.end());
++                if (list.empty()) {
++                    pendingLoads.erase(it);
++                }
++            }
++        } else {
++            for (auto it = pendingLoads.begin(); it != pendingLoads.end(); ) {
++                auto &list = it->second;
++                list.erase(
++                    std::remove_if(list.begin(), list.end(),
++                                   [loadSeq](const PendingLoad &l) {
++                                       return l.loadSeq == loadSeq;
++                                   }),
++                    list.end());
++                if (list.empty()) {
++                    it = pendingLoads.erase(it);
++                } else {
++                    ++it;
++                }
++            }
 +        }
 +    }
 +
@@ -3502,10 +3572,10 @@ index 0000000000..6280eed4ba
 +#endif // __CPU_VALUEPRED_MEMORY_RENAMING_PIPELINE_HARNESS_HH__
 diff --git a/src/cpu/valuepred/memory_renaming_rename_pipeline.test.cc b/src/cpu/valuepred/memory_renaming_rename_pipeline.test.cc
 new file mode 100644
-index 0000000000..40e43c9344
+index 0000000000..ea0ccf20e4
 --- /dev/null
 +++ b/src/cpu/valuepred/memory_renaming_rename_pipeline.test.cc
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,197 @@
 +#include <gtest/gtest.h>
 +
 +#include "cpu/valuepred/memory_renaming_pipeline_harness.hh"
@@ -3675,12 +3745,40 @@ index 0000000000..40e43c9344
 +    EXPECT_EQ(result.producerOffset, 0);
 +    EXPECT_EQ(commit.vpCorrect, 1u);
 +}
++
++TEST_F(RenamePipelineTest, O1LSUCompletion)
++{
++    RenamePipelineHarness harness(core);
++
++    Addr storePC = 0x1000;
++    Addr loadPC = 0x1500;
++
++    // Rename store with physical register 5 (pending writeback)
++    harness.renameStore(storePC, 10, 5, false, 0);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++    harness.core.trainMRP(loadPC, storePC, 0, true);
++
++    // Rename load at seq 12 targeting destination register 8
++    EXPECT_TRUE(harness.renameLoad(loadPC, 12, 8));
++    EXPECT_EQ(harness.pendingCount(), 1u);
++
++    // Verify it is in the pendingLoads queue for producer register 5
++    auto &list = harness.pendingLoads[5];
++    EXPECT_EQ(list.size(), 1u);
++    EXPECT_EQ(list[0].loadSeq, 12);
++    EXPECT_EQ(list[0].producerPhysReg, 5);
++
++    // Call completeLoadLSU with the producer register index 5
++    harness.completeLoadLSU(12, 5);
++    EXPECT_EQ(harness.pendingCount(), 0u);
++}
++
 diff --git a/src/cpu/valuepred/valuepred_metadata.hh b/src/cpu/valuepred/valuepred_metadata.hh
 new file mode 100644
-index 0000000000..1122a7d0c3
+index 0000000000..ba3fe254c6
 --- /dev/null
 +++ b/src/cpu/valuepred/valuepred_metadata.hh
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,212 @@
 +#ifndef __VALUEPRED_METADATA_HH_
 +#define __VALUEPRED_METADATA_HH_
 +
@@ -3865,6 +3963,8 @@ index 0000000000..1122a7d0c3
 +    RegVal value = 0;
 +    // is the predicted value ready to be consumed?
 +    bool dataReady = false;
++    // producer physical register index
++    RegIndex producerPhysReg = 0;
 +};
 +
 +class VPPredictionCandidate

@@ -164,6 +164,22 @@ def load_experiments(experiment_file: Path) -> tuple[list[dict[str, Any]], dict[
         data = json.load(f)
     
     globals_dict = data.get("globals", {})
+    
+    # Validate that all required global baseline parameters are specified
+    required_keys = {"gem5_config", "num_cores", "max_insts", "threads", "lq_entries", "sq_entries", "lsu_ports", "physreg"}
+    missing_keys = required_keys - set(globals_dict.keys())
+    if missing_keys:
+        raise ValueError(
+            f"Invalid experiment configuration file '{experiment_file}': "
+            f"The 'globals' section is missing required baseline parameters: {', '.join(sorted(missing_keys))}"
+        )
+        
+    # Split baseline lsu_ports into load_ports and store_ports inside globals_dict
+    lports, sports = map(int, str(globals_dict["lsu_ports"]).split(":"))
+    globals_dict["load_ports"] = lports
+    globals_dict["store_ports"] = sports
+    del globals_dict["lsu_ports"]
+    
     runs = []
     
     for exp in data.get("experiments", []):
@@ -208,29 +224,31 @@ def load_experiments(experiment_file: Path) -> tuple[list[dict[str, Any]], dict[
 
 def get_config_label(run_dict: dict[str, Any], global_defaults: dict[str, Any]) -> str:
     mr_mode = run_dict.get("mr_mode", "off")
-    physreg = run_dict.get("physreg", 180)
     
-    b_lq = global_defaults.get("lq_entries", 72)
-    b_sq = global_defaults.get("sq_entries", 56)
+    b_physreg = global_defaults["physreg"]
+    b_lq = global_defaults["lq_entries"]
+    b_sq = global_defaults["sq_entries"]
+    b_load_ports = global_defaults["load_ports"]
+    b_store_ports = global_defaults["store_ports"]
     
+    physreg = run_dict.get("physreg", b_physreg)
     lq = run_dict.get("lq_entries", b_lq)
     sq = run_dict.get("sq_entries", b_sq)
+    load_ports = run_dict.get("load_ports", b_load_ports)
+    store_ports = run_dict.get("store_ports", b_store_ports)
+    num_cores = run_dict.get("num_cores", 1)
     
     lq_str = "ts" if isinstance(lq, str) and lq.startswith("trace-scaled") else str(lq)
     sq_str = "ts" if isinstance(sq, str) and sq.startswith("trace-scaled") else str(sq)
     
-    load_ports = run_dict.get("load_ports", 2)
-    store_ports = run_dict.get("store_ports", 1)
-    num_cores = run_dict.get("num_cores", 1)
-    
     if mr_mode == "off":
-        if physreg == 180 and lq == b_lq and sq == b_sq and load_ports == 2 and store_ports == 1:
+        if physreg == b_physreg and lq == b_lq and sq == b_sq and load_ports == b_load_ports and store_ports == b_store_ports:
             base = "stock"
         else:
             parts = []
-            if physreg != 180:
+            if physreg != b_physreg:
                 parts.append(f"prf_{physreg}")
-            if load_ports != 2 or store_ports != 1:
+            if load_ports != b_load_ports or store_ports != b_store_ports:
                 parts.append(f"bw_{load_ports}x{store_ports}")
             if lq != b_lq or sq != b_sq:
                 parts.append(f"lq{lq_str}_sq{sq_str}")
@@ -275,7 +293,7 @@ def get_config_label(run_dict: dict[str, Any], global_defaults: dict[str, Any]) 
             
             if lq != b_lq or sq != b_sq:
                 parts.append(f"lq{lq_str}_sq{sq_str}")
-            if physreg != 180:
+            if physreg != b_physreg:
                 parts.append(f"prf{physreg}")
                 
             base = "_".join(parts)
@@ -483,8 +501,8 @@ def main() -> int:
             config_label = get_config_label(params, globals_dict)
             
             # Resolve "trace-scaled" queue sizes if specified
-            base_lq = globals_dict.get("lq_entries", 72)
-            base_sq = globals_dict.get("sq_entries", 56)
+            base_lq = globals_dict["lq_entries"]
+            base_sq = globals_dict["sq_entries"]
             
             lq_val = params.get("lq_entries")
             sq_val = params.get("sq_entries")
