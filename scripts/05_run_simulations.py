@@ -44,6 +44,34 @@ CONFIGS = {
     "multicore": ROOT_DIR / "configs/run_o3_benchmark_multicore.py",
 }
 
+# ─── Parameter registry ────────────────────────────────────────────────
+# To add a new sweep parameter, add an entry here.  build_gem5_args()
+# and load_experiments() both derive their mappings from this table.
+#
+#   json_key:   key used in experiment JSON and run dicts
+#   cli_flag:   gem5 config script command-line flag
+#   required:   must be present in the experiment JSON "globals" section
+#               (note: lsu_ports is split into load_ports/store_ports
+#               before validation, so load_ports/store_ports are required
+#               here while lsu_ports is validated separately)
+PARAM_REGISTRY: list[tuple[str, str, bool]] = [
+    # (json_key,                      cli_flag,                   required)
+    ("mr_mode",                       "--mr-mode",                False),
+    ("physreg",                       "--physreg",                True),
+    ("lq_entries",                    "--lq-entries",             True),
+    ("sq_entries",                    "--sq-entries",             True),
+    ("load_ports",                    "--load-ports",             False),
+    ("store_ports",                   "--store-ports",            False),
+    ("max_insts",                     "--max-insts",              True),
+    ("num_cores",                     "--num-cores",              True),
+    ("mrp_log_max_confidence",        "--log-max-confidence",     False),
+    ("mrp_prediction_threshold",      "--prediction-threshold",   False),
+    ("mrp_allocation_confidence",     "--allocation-confidence",  False),
+    ("mrp_realloc_penalty",           "--realloc-penalty",        False),
+    ("mrp_realloc_reinit",            "--realloc-reinit",         False),
+    ("mrp_demotion_penalty",          "--demotion-penalty",       False),
+]
+
 
 @dataclass(frozen=True)
 class Profile:
@@ -165,8 +193,12 @@ def load_experiments(experiment_file: Path) -> tuple[list[dict[str, Any]], dict[
     
     globals_dict = data.get("globals", {})
     
-    # Validate that all required global baseline parameters are specified
-    required_keys = {"gem5_config", "num_cores", "max_insts", "threads", "lq_entries", "sq_entries", "lsu_ports", "physreg"}
+    # Validate that all required global baseline parameters are specified.
+    # gem5_config, threads, and lsu_ports are always required but are not in
+    # PARAM_REGISTRY (lsu_ports is split into load_ports/store_ports later).
+    required_keys = {"gem5_config", "threads", "lsu_ports"} | {
+        key for key, _, req in PARAM_REGISTRY if req
+    }
     missing_keys = required_keys - set(globals_dict.keys())
     if missing_keys:
         raise ValueError(
@@ -304,31 +336,18 @@ def get_config_label(run_dict: dict[str, Any], global_defaults: dict[str, Any]) 
 
 
 def build_gem5_args(run_dict: dict[str, Any]) -> list[str]:
-    mapping = {
-        "mr_mode": "--mr-mode",
-        "physreg": "--physreg",
-        "lq_entries": "--lq-entries",
-        "sq_entries": "--sq-entries",
-        "load_ports": "--load-ports",
-        "store_ports": "--store-ports",
-        "max_insts": "--max-insts",
-        "num_cores": "--num-cores",
-        "mrp_log_max_confidence": "--log-max-confidence",
-        "mrp_prediction_threshold": "--prediction-threshold",
-        "mrp_allocation_confidence": "--allocation-confidence",
-        "mrp_realloc_penalty": "--realloc-penalty",
-        "mrp_realloc_reinit": "--realloc-reinit",
-        "mrp_demotion_penalty": "--demotion-penalty",
-    }
+    """Build gem5 CLI arguments from a run dict using PARAM_REGISTRY."""
     args = []
-    for key, flag in mapping.items():
+    for key, flag, _ in PARAM_REGISTRY:
         if key in run_dict and run_dict[key] is not None:
             args.extend([flag, str(run_dict[key])])
     return args
 
 
-def execute_one(record: dict[str, Any], timeout: int, grace_period: int = 30) -> tuple[str, int | None, str | None]:
+def execute_one(record: dict[str, Any], timeout: int, grace_period: int = 30, output_dir: Path | None = None) -> tuple[str, int | None, str | None]:
     outdir = Path(record["outdir"])
+    if not outdir.is_absolute() and output_dir is not None:
+        outdir = output_dir / outdir
     outdir.mkdir(parents=True, exist_ok=True)
     command = shlex.split(record["command"])
     cwd = Path(record["cwd"])
@@ -396,7 +415,18 @@ def get_default_jobs(mem_per_job_gb: float) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Resume Behavior:
+  Use --resume to resume a previous run. If --output-dir is not specified, the script
+  will automatically find and resume the latest run directory under results/gem5_sim_runs/.
+  A previous run is cached (skipped) if it has a non-empty stats.txt file, regardless
+  of whether its status was "finished" or "timed_out". Failed runs are always re-run.
+  Timed-out runs without a non-empty stats.txt are also re-run.
+"""
+    )
     parser.add_argument("--experiment-file", default="baseline_sweeps.json", help="Path to the JSON experiment config file")
     parser.add_argument("--profile-dir", help="timestamp directory under results/dr_tool_runs (defaults to latest)")
     parser.add_argument("--sizes", default="all", help="comma-separated sizes, or all")
@@ -404,10 +434,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--grace-period", type=int, default=30, help="Grace period in seconds for gem5 to clean up and dump stats after timeout (default: 30)")
     parser.add_argument("--jobs", "-j", type=int, default=None, help="number of parallel simulation jobs to run (default: min(nproc, sys_mem/mem-per-job))")
-    parser.add_argument("--mem-per-job", type=float, default=2.5, help="Estimated memory required per simulation job in GB (default: 3.0)")
+    parser.add_argument("--mem-per-job", type=float, default=2.5, help="Estimated memory required per simulation job in GB (default: 2.5)")
     parser.add_argument("--skip-build", action="store_true", help="reuse an existing gem5 binary without applying patches or running SCons")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output-dir", help="output directory (defaults to timestamped results/gem5_sim_runs directory)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume a previous run.  Defaults --output-dir to the latest "
+                             "run directory.  Skips any run whose stats.txt already exists; "
+                             "always re-runs failed runs, and re-runs timed-out runs only "
+                             "when their stats.txt is missing.")
     
     args = parser.parse_args()
     if args.sizes == "all":
@@ -427,6 +462,256 @@ def parse_args() -> argparse.Namespace:
         if getattr(args, option) <= 0:
             parser.error(f"--{option.replace('_', '-')} must be positive")
     return args
+
+
+def resolve_trace_scaled_entries(params: dict[str, Any], profile: Profile, globals_dict: dict[str, Any]) -> None:
+    """Resolve 'trace-scaled*' LQ/SQ entries to integer values using profile data.
+
+    Mutates *params* in-place, replacing any ``trace-scaled*`` string value
+    for ``lq_entries`` or ``sq_entries`` with the computed integer size.
+    """
+    base_lq = globals_dict["lq_entries"]
+    base_sq = globals_dict["sq_entries"]
+
+    lq_val = params.get("lq_entries")
+    sq_val = params.get("sq_entries")
+
+    if not ((isinstance(lq_val, str) and lq_val.startswith("trace-scaled")) or
+            (isinstance(sq_val, str) and sq_val.startswith("trace-scaled"))):
+        return
+
+    memory_ops = profile.data.get("memory_ops", {})
+    loads = memory_ops.get("loads", 1)
+    stores = memory_ops.get("stores", 1)
+    pushes = memory_ops.get("pushes", 0)
+    pops = memory_ops.get("pops", 0)
+
+    load_pop_ratio = pops / loads if loads > 0 else 0.0
+    store_push_ratio = pushes / stores if stores > 0 else 0.0
+
+    stack_ops = profile.data.get("stack_ops", {})
+    stack_total = stack_ops.get("total", 1)
+
+    def _private_percentage(spec: str) -> float:
+        if spec == "trace-scaled-strict":
+            selected_ipc = stack_ops.get("strictly_ipc", 0)
+        elif spec == "trace-scaled-history":
+            selected_ipc = stack_ops.get("possibly_ipc_hist", 0)
+        elif spec == "trace-scaled-non-history":
+            selected_ipc = stack_ops.get("possibly_ipc_non_hist", 0)
+        else:  # default "trace-scaled"
+            selected_ipc = stack_total - stack_ops.get("provably_private", 0)
+
+        priv_pct = (stack_total - selected_ipc) / stack_total if stack_total > 0 else 0.0
+        return min(max(0.0, priv_pct), 0.95)
+
+    if isinstance(lq_val, str) and lq_val.startswith("trace-scaled"):
+        lq_priv_pct = _private_percentage(lq_val)
+        lq_factor = min(load_pop_ratio * lq_priv_pct, 0.95)
+        params["lq_entries"] = int(base_lq / (1.0 - lq_factor))
+
+    if isinstance(sq_val, str) and sq_val.startswith("trace-scaled"):
+        sq_priv_pct = _private_percentage(sq_val)
+        sq_factor = min(store_push_ratio * sq_priv_pct, 0.95)
+        params["sq_entries"] = int(base_sq / (1.0 - sq_factor))
+
+
+def report_completion(
+    record: dict[str, Any],
+    index: int,
+    total: int,
+    n_finished: int,
+    n_failed: int,
+    n_timed_out: int,
+) -> tuple[int, int, int]:
+    """Print a status line for a completed run and update counters."""
+    status = record["status"]
+    if status == "finished":
+        status_icon = "✓"
+        n_finished += 1
+    elif status == "timed_out":
+        status_icon = "~"
+        n_timed_out += 1
+    else:
+        status_icon = "✗"
+        n_failed += 1
+    print(f"  [{index}/{total}] {status_icon} {record['profile']} / {record['config_label']}")
+    return n_finished, n_failed, n_timed_out
+
+
+def resolve_runs(
+    profiles: list[Profile],
+    experiment_configs: list[dict[str, Any]],
+    globals_dict: dict[str, Any],
+    output_dir: Path,
+    profile_dir: Path,
+    args: argparse.Namespace,
+    timestamp: str,
+    skipped: list[dict[str, str]],
+) -> dict[str, Any]:
+    manifest_path = output_dir / "run_manifest.json"
+    if not args.resume and args.output_dir and manifest_path.is_file():
+        raise ValueError(
+            f"Output directory {output_dir} already exists and contains a run manifest. "
+            f"To resume this run, use the --resume flag. Otherwise, specify a different --output-dir."
+        )
+
+    previous_runs = {}
+    if args.resume and manifest_path.is_file():
+        try:
+            prev_manifest = json.loads(manifest_path.read_text())
+            for r in prev_manifest.get("runs", []):
+                key = (r["profile"], r.get("config_label", r.get("label", "")))
+                previous_runs[key] = r
+        except Exception:
+            pass
+
+    manifest: dict[str, Any] = {
+        "created_at": timestamp,
+        "dry_run": args.dry_run,
+        "profile_dir": str(profile_dir.relative_to(ROOT_DIR)) if profile_dir.is_relative_to(ROOT_DIR) else str(profile_dir),
+        "arguments": {key: value for key, value in vars(args).items() if key not in {"sizes", "benchmarks"}},
+        "sizes": sorted(args.sizes),
+        "benchmarks": sorted(args.benchmarks),
+        "skipped_profiles": skipped,
+        "runs": [],
+    }
+    
+    for profile in profiles:
+        for run_params in experiment_configs:
+            params = dict(run_params)
+            
+            gem5_cfg_name = params.get("gem5_config", "single")
+            num_cores = params.get("num_cores", 1)
+            threads = params.get("threads", 1)
+            
+            if gem5_cfg_name not in CONFIGS:
+                raise ValueError(f"Unknown gem5_config '{gem5_cfg_name}'")
+                
+            if gem5_cfg_name in ("single", "mock") and num_cores != 1:
+                raise ValueError(f"{gem5_cfg_name} config requires num_cores=1, got {num_cores}")
+                
+            if threads != num_cores:
+                print(f"Warning: OpenMP threads ({threads}) != num_cores ({num_cores}). This may cause artificial scheduling overhead.", file=sys.stderr)
+                
+            config_label = get_config_label(params, globals_dict)
+            resolve_trace_scaled_entries(params, profile, globals_dict)
+            
+            outdir = output_dir / profile.name / config_label
+            
+            gem5_args = build_gem5_args(params)
+            gem5_config_path = CONFIGS[gem5_cfg_name]
+            launcher = [str(GEM5_BIN), f"--outdir={outdir}", str(gem5_config_path)] + gem5_args
+            
+            command, cwd = workload_command(profile, launcher, threads, outdir)
+            
+            record = {
+                "profile": profile.name,
+                "profile_path": str(profile.path.relative_to(ROOT_DIR)) if profile.path.is_relative_to(ROOT_DIR) else str(profile.path),
+                "profile_status": profile.status,
+                "config_label": config_label,
+                "status": "planned",
+                "returncode": None,
+                "error": None,
+                "outdir": str(outdir.relative_to(output_dir)),
+                "cwd": str(cwd),
+                "command": shlex.join(command),
+                **params
+            }
+            # Check if this run was already completed or has usable data
+            prev_record = previous_runs.get((profile.name, config_label))
+            if prev_record:
+                prev_status = prev_record.get("status", "")
+                stats_file = outdir / "stats.txt"
+                has_stats = stats_file.is_file() and stats_file.stat().st_size > 0
+                if prev_status == "failed":
+                    # Always re-run failed runs
+                    pass
+                elif has_stats:
+                    # Cache any run (finished or timed_out) that has usable data
+                    record["status"] = prev_status
+                    record["returncode"] = prev_record.get("returncode")
+                    record["error"] = prev_record.get("error")
+            manifest["runs"].append(record)
+            
+    # Print resume summary if there are cached runs
+    n_cached = sum(1 for r in manifest["runs"] if r["status"] in ("finished", "timed_out"))
+    n_planned = sum(1 for r in manifest["runs"] if r["status"] == "planned")
+    if n_cached > 0:
+        n_cached_finished = sum(1 for r in manifest["runs"] if r["status"] == "finished")
+        n_cached_timedout = sum(1 for r in manifest["runs"] if r["status"] == "timed_out")
+        parts = [f"{n_cached_finished} finished (cached)"]
+        if n_cached_timedout:
+            parts.append(f"{n_cached_timedout} timed_out (cached)")
+        parts.append(f"{n_planned} planned")
+        print(f"Resuming: {', '.join(parts)}.")
+    
+    write_manifests(output_dir, manifest)
+    return manifest
+
+
+def execute_runs(
+    manifest: dict[str, Any],
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> tuple[int, int, int]:
+    n_finished = 0
+    n_failed = 0
+    n_timed_out = 0
+    completed_count = 0
+    
+    if args.jobs <= 1:
+        for record in manifest["runs"]:
+            completed_count += 1
+            if record["status"] in ("finished", "timed_out"):
+                if record["status"] == "finished":
+                    n_finished += 1
+                    status_icon = "✓"
+                else:
+                    n_timed_out += 1
+                    status_icon = "~"
+                print(f"  [{completed_count}/{len(manifest['runs'])}] {status_icon} {record['profile']} / {record['config_label']} (cached)")
+                continue
+            status, returncode, error = execute_one(record, args.timeout, args.grace_period, output_dir)
+            record.update(status=status, returncode=returncode, error=error)
+            n_finished, n_failed, n_timed_out = report_completion(
+                record, completed_count, len(manifest["runs"]),
+                n_finished, n_failed, n_timed_out)
+            write_manifests(output_dir, manifest)
+    else:
+        print(f"\nLaunching {len(manifest['runs'])} simulations across {args.jobs} workers...")
+        with ProcessPoolExecutor(max_workers=args.jobs) as executor:
+            future_to_record = {}
+            for record in manifest["runs"]:
+                if record["status"] in ("finished", "timed_out"):
+                    completed_count += 1
+                    if record["status"] == "finished":
+                        n_finished += 1
+                        status_icon = "✓"
+                    else:
+                        n_timed_out += 1
+                        status_icon = "~"
+                    print(f"  [{completed_count}/{len(manifest['runs'])}] {status_icon} {record['profile']} / {record['config_label']} (cached)")
+                    continue
+                future = executor.submit(execute_one, record, args.timeout, args.grace_period, output_dir)
+                future_to_record[future] = record
+                
+            if future_to_record:
+                for future in as_completed(future_to_record):
+                    completed_count += 1
+                    record = future_to_record[future]
+                    status, returncode, error = future.result()
+                    record.update(status=status, returncode=returncode, error=error)
+                    n_finished, n_failed, n_timed_out = report_completion(
+                        record, completed_count, len(manifest["runs"]),
+                        n_finished, n_failed, n_timed_out)
+                    write_manifests(output_dir, manifest)
+                    
+    return n_finished, n_failed, n_timed_out
+
+
+def print_summary(manifest: dict[str, Any], n_finished: int, n_failed: int, n_timed_out: int) -> None:
+    print(f"Completed {len(manifest['runs'])} simulations: {n_finished} finished, {n_failed} failed, {n_timed_out} timed out.")
 
 
 def main() -> int:
@@ -451,133 +736,38 @@ def main() -> int:
         return 1
         
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_dir = Path(args.output_dir) if args.output_dir else SIM_ROOT / timestamp
+    if args.resume:
+        if args.output_dir:
+            output_dir = Path(args.output_dir)
+        else:
+            # Default to the latest existing run directory
+            candidates = sorted(
+                [d for d in SIM_ROOT.iterdir() if d.is_dir() and (d / "run_manifest.json").exists()]
+            ) if SIM_ROOT.is_dir() else []
+            if not candidates:
+                print("No previous run directories found to resume.", file=sys.stderr)
+                return 1
+            output_dir = candidates[-1]
+            print(f"Resuming from: {output_dir}")
+    else:
+        output_dir = Path(args.output_dir) if args.output_dir else SIM_ROOT / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    previous_runs = {}
-    manifest_path = output_dir / "run_manifest.json"
-    if manifest_path.is_file():
-        try:
-            prev_manifest = json.loads(manifest_path.read_text())
-            for r in prev_manifest.get("runs", []):
-                key = (r["profile"], r["config_label"])
-                previous_runs[key] = r
-        except Exception:
-            pass
-    
-    manifest: dict[str, Any] = {
-        "created_at": timestamp,
-        "dry_run": args.dry_run,
-        "profile_dir": str(profile_dir),
-        "config": "dynamic",
-        "arguments": {key: value for key, value in vars(args).items() if key not in {"sizes", "benchmarks"}},
-        "sizes": sorted(args.sizes),
-        "benchmarks": sorted(args.benchmarks),
-        "skipped_profiles": skipped,
-        "runs": [],
-    }
-    
-    for profile in profiles:
-        for run_params in experiment_configs:
-            params = dict(run_params)
-            
-            gem5_cfg_name = params.get("gem5_config", "single")
-            num_cores = params.get("num_cores", 1)
-            threads = params.get("threads", 1)
-            
-            if gem5_cfg_name not in CONFIGS:
-                print(f"Error: Unknown gem5_config '{gem5_cfg_name}'", file=sys.stderr)
-                sys.exit(1)
-                
-            if gem5_cfg_name in ("single", "mock") and num_cores != 1:
-                print(f"Error: {gem5_cfg_name} config requires num_cores=1, got {num_cores}", file=sys.stderr)
-                sys.exit(1)
-                
-            if threads != num_cores:
-                print(f"Warning: OpenMP threads ({threads}) != num_cores ({num_cores}). This may cause artificial scheduling overhead.", file=sys.stderr)
-                
-            # Generate the configuration label immediately.
-            # This ensures get_config_label sees the literal string "trace-scaled".
-            config_label = get_config_label(params, globals_dict)
-            
-            # Resolve "trace-scaled" queue sizes if specified
-            base_lq = globals_dict["lq_entries"]
-            base_sq = globals_dict["sq_entries"]
-            
-            lq_val = params.get("lq_entries")
-            sq_val = params.get("sq_entries")
-            
-            if (isinstance(lq_val, str) and lq_val.startswith("trace-scaled")) or \
-               (isinstance(sq_val, str) and sq_val.startswith("trace-scaled")):
-                
-                memory_ops = profile.data.get("memory_ops", {})
-                loads = memory_ops.get("loads", 1)
-                stores = memory_ops.get("stores", 1)
-                pushes = memory_ops.get("pushes", 0)
-                pops = memory_ops.get("pops", 0)
-                
-                load_pop_ratio = pops / loads if loads > 0 else 0.0
-                store_push_ratio = pushes / stores if stores > 0 else 0.0
-                
-                stack_ops = profile.data.get("stack_ops", {})
-                stack_total = stack_ops.get("total", 1)
-                
-                # Helper function to get private percentage for a given spec
-                def get_private_percentage(spec: str) -> float:
-                    if spec == "trace-scaled-strict":
-                        selected_ipc = stack_ops.get("strictly_ipc", 0)
-                    elif spec == "trace-scaled-history":
-                        selected_ipc = stack_ops.get("possibly_ipc_hist", 0)
-                    elif spec == "trace-scaled-non-history":
-                        selected_ipc = stack_ops.get("possibly_ipc_non_hist", 0)
-                    else:  # default "trace-scaled"
-                        selected_ipc = stack_total - stack_ops.get("provably_private", 0)
-                    
-                    priv_pct = (stack_total - selected_ipc) / stack_total if stack_total > 0 else 0.0
-                    return min(max(0.0, priv_pct), 0.95)
-                
-                if isinstance(lq_val, str) and lq_val.startswith("trace-scaled"):
-                    lq_priv_pct = get_private_percentage(lq_val)
-                    lq_factor = min(load_pop_ratio * lq_priv_pct, 0.95)
-                    params["lq_entries"] = int(base_lq / (1.0 - lq_factor))
-                    
-                if isinstance(sq_val, str) and sq_val.startswith("trace-scaled"):
-                    sq_priv_pct = get_private_percentage(sq_val)
-                    sq_factor = min(store_push_ratio * sq_priv_pct, 0.95)
-                    params["sq_entries"] = int(base_sq / (1.0 - sq_factor))
-            
-            outdir = output_dir / profile.name / config_label
-            
-            gem5_args = build_gem5_args(params)
-            gem5_config_path = CONFIGS[gem5_cfg_name]
-            launcher = [str(GEM5_BIN), f"--outdir={outdir}", str(gem5_config_path)] + gem5_args
-            
-            command, cwd = workload_command(profile, launcher, threads, outdir)
-            
-            record = {
-                "profile": profile.name,
-                "profile_path": str(profile.path),
-                "profile_status": profile.status,
-                "config_label": config_label,
-                "status": "planned",
-                "returncode": None,
-                "error": None,
-                "outdir": str(outdir),
-                "cwd": str(cwd),
-                "command": shlex.join(command),
-                **params
-            }
-            # Check if this run was already completed in a previous attempt
-            prev_record = previous_runs.get((profile.name, config_label))
-            if prev_record and prev_record.get("status") == "finished":
-                stats_file = outdir / "stats.txt"
-                if stats_file.is_file() and stats_file.stat().st_size > 0:
-                    record["status"] = "finished"
-                    record["returncode"] = prev_record.get("returncode", 0)
-                    record["error"] = prev_record.get("error")
-            manifest["runs"].append(record)
-            
-    write_manifests(output_dir, manifest)
+    try:
+        manifest = resolve_runs(
+            profiles=profiles,
+            experiment_configs=experiment_configs,
+            globals_dict=globals_dict,
+            output_dir=output_dir,
+            profile_dir=profile_dir,
+            args=args,
+            timestamp=timestamp,
+            skipped=skipped,
+        )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+        
     print(f"Resolved {len(manifest['runs'])} simulations from {len(profiles)} profiles.")
     print(f"Manifest: {output_dir / 'run_manifest.json'}")
     if args.dry_run:
@@ -599,58 +789,10 @@ def main() -> int:
             write_manifests(output_dir, manifest)
             return error.returncode or 1
             
-    failures = 0
-    completed_count = 0
+    n_finished, n_failed, n_timed_out = execute_runs(manifest, output_dir, args)
     
-    if args.jobs <= 1:
-        for record in manifest["runs"]:
-            completed_count += 1
-            if record["status"] == "finished":
-                print(f"  [{completed_count}/{len(manifest['runs'])}] ✓ {record['profile']} / {record['config_label']} (cached)")
-                continue
-            status, returncode, error = execute_one(record, args.timeout, args.grace_period)
-            record.update(status=status, returncode=returncode, error=error)
-            if status == "finished":
-                status_icon = "✓"
-            elif status == "timed_out":
-                status_icon = "~"
-            else:
-                status_icon = "✗"
-            print(f"  [{completed_count}/{len(manifest['runs'])}] {status_icon} {record['profile']} / {record['config_label']}")
-            if status != "finished":
-                failures += 1
-            write_manifests(output_dir, manifest)
-    else:
-        print(f"\nLaunching {len(manifest['runs'])} simulations across {args.jobs} workers...")
-        with ProcessPoolExecutor(max_workers=args.jobs) as executor:
-            future_to_record = {}
-            for record in manifest["runs"]:
-                if record["status"] == "finished":
-                    completed_count += 1
-                    print(f"  [{completed_count}/{len(manifest['runs'])}] ✓ {record['profile']} / {record['config_label']} (cached)")
-                    continue
-                future = executor.submit(execute_one, record, args.timeout, args.grace_period)
-                future_to_record[future] = record
-                
-            if future_to_record:
-                for future in as_completed(future_to_record):
-                    completed_count += 1
-                    record = future_to_record[future]
-                    status, returncode, error = future.result()
-                    record.update(status=status, returncode=returncode, error=error)
-                    if status == "finished":
-                        status_icon = "✓"
-                    elif status == "timed_out":
-                        status_icon = "~"
-                    else:
-                        status_icon = "✗"
-                    print(f"  [{completed_count}/{len(manifest['runs'])}] {status_icon} {record['profile']} / {record['config_label']}")
-                    if status != "finished":
-                        failures += 1
-                    write_manifests(output_dir, manifest)
-                
-    print(f"Completed {len(manifest['runs'])} simulations; failures: {failures}.")
-    return 1 if failures else 0
+    print_summary(manifest, n_finished, n_failed, n_timed_out)
+    return 1 if n_failed else 0
 
 
 if __name__ == "__main__":

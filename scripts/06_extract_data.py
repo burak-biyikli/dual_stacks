@@ -81,7 +81,10 @@ def parse_stats_file(stats_path: Path) -> dict:
     return extracted
 
 def select_sim_dir(value: Path | None) -> Path:
-    """Selects the simulation directory, defaulting to the newest run with a manifest."""
+    """Selects the simulation directory, defaulting to the newest run with a manifest.
+    
+    Raises FileNotFoundError if no valid directory can be found.
+    """
     if value:
         candidate = Path(value)
         if not candidate.is_absolute():
@@ -90,29 +93,34 @@ def select_sim_dir(value: Path | None) -> Path:
             if sim_root_candidate.is_dir():
                 return sim_root_candidate.resolve()
         if not candidate.is_dir():
-            print(f"Error: Simulation directory not found: {candidate}", file=sys.stderr)
-            sys.exit(1)
+            raise FileNotFoundError(f"Simulation directory not found: {candidate}")
         return candidate.resolve()
 
     if not SIM_ROOT.exists() or not SIM_ROOT.is_dir():
-        print(f"Error: Simulation root directory does not exist: {SIM_ROOT}", file=sys.stderr)
-        sys.exit(1)
+        raise FileNotFoundError(f"Simulation root directory does not exist: {SIM_ROOT}")
 
     # Find the newest run directory containing run_manifest.json
     candidates = sorted(
         [d for d in SIM_ROOT.iterdir() if d.is_dir() and (d / "run_manifest.json").exists()]
     )
     if not candidates:
-        print(f"Error: No simulation directories containing run_manifest.json found in {SIM_ROOT}", file=sys.stderr)
-        sys.exit(1)
+        raise FileNotFoundError(f"No simulation directories containing run_manifest.json found in {SIM_ROOT}")
     
     selected = candidates[-1]
     print(f"Using newest simulation directory: {selected}")
     return selected.resolve()
 
+def _resolve_outdir(run: dict, sim_dir: Path) -> Path:
+    """Resolve outdir from a manifest run record, handling both relative and absolute paths."""
+    outdir = Path(run["outdir"])
+    if not outdir.is_absolute():
+        outdir = sim_dir / outdir
+    return outdir
+
+
 def sanity_check_runs(sim_dir: Path, runs: list[dict]) -> None:
     """Sanity checks the directories and files on disk against the manifest runs."""
-    expected_outdirs = {Path(run["outdir"]).resolve() for run in runs}
+    expected_outdirs = {_resolve_outdir(run, sim_dir).resolve() for run in runs}
     
     actual_outdirs = set()
     if sim_dir.is_dir():
@@ -128,14 +136,20 @@ def sanity_check_runs(sim_dir: Path, runs: list[dict]) -> None:
     if missing_dirs:
         print(f"Warning: {len(missing_dirs)} run directories expected by the manifest do not exist on disk.", file=sys.stderr)
         for d in sorted(list(missing_dirs))[:5]:
-            print(f"  - Missing: {d.relative_to(sim_dir.parent)}", file=sys.stderr)
+            try:
+                print(f"  - Missing: {d.relative_to(sim_dir)}", file=sys.stderr)
+            except ValueError:
+                print(f"  - Missing: {d}", file=sys.stderr)
         if len(missing_dirs) > 5:
             print(f"  - ... and {len(missing_dirs) - 5} more.", file=sys.stderr)
 
     if unexpected_dirs:
         print(f"Warning: Found {len(unexpected_dirs)} directories on disk that are not listed in the manifest.", file=sys.stderr)
         for d in sorted(list(unexpected_dirs))[:5]:
-            print(f"  - Unexpected: {d.relative_to(sim_dir.parent)}", file=sys.stderr)
+            try:
+                print(f"  - Unexpected: {d.relative_to(sim_dir)}", file=sys.stderr)
+            except ValueError:
+                print(f"  - Unexpected: {d}", file=sys.stderr)
         if len(unexpected_dirs) > 5:
             print(f"  - ... and {len(unexpected_dirs) - 5} more.", file=sys.stderr)
 
@@ -143,10 +157,11 @@ def sanity_check_runs(sim_dir: Path, runs: list[dict]) -> None:
     finished_but_no_stats = []
     for run in runs:
         if run.get("status") == "finished":
-            outdir = Path(run["outdir"])
+            outdir = _resolve_outdir(run, sim_dir)
             stats_txt = outdir / "stats.txt"
             if not stats_txt.is_file():
-                finished_but_no_stats.append(f"{run['profile']} / {run.get('config_label', 'unknown')}")
+                cfg_label = run.get('config_label', run.get('label', 'unknown'))
+                finished_but_no_stats.append(f"{run['profile']} / {cfg_label}")
 
     if finished_but_no_stats:
         print(f"Warning: {len(finished_but_no_stats)} runs are marked 'finished' in manifest but missing 'stats.txt'.", file=sys.stderr)
@@ -164,7 +179,11 @@ def main():
     )
     args = parser.parse_args()
 
-    sim_dir = select_sim_dir(args.sim_dir)
+    try:
+        sim_dir = select_sim_dir(args.sim_dir)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
     manifest_path = sim_dir / "run_manifest.json"
     if not manifest_path.exists():
@@ -185,7 +204,17 @@ def main():
     # Extract metadata headers dynamically from the first run in the manifest,
     # excluding execution/internal-specific details.
     excluded_fields = {"profile_path", "profile_status", "label", "returncode", "error", "outdir", "cwd", "command"}
-    metadata_headers = [key for key in runs[0].keys() if key not in excluded_fields]
+    first_cols = ["profile", "config_label", "experiment"]
+    other_cols = sorted([key for key in runs[0].keys() if key not in excluded_fields and key not in first_cols])
+    
+    # Ensure config_label is always present in headers even if old manifest only has "label"
+    metadata_headers = []
+    for c in first_cols:
+        if c == "config_label":
+            metadata_headers.append(c)
+        elif c in runs[0]:
+            metadata_headers.append(c)
+    metadata_headers.extend(other_cols)
     print(f"Extracted metadata columns from manifest: {metadata_headers}")
 
     stat_headers = list(TARGET_STATS.values())
@@ -204,10 +233,10 @@ def main():
             
             # Ensure essential fields for compute_summary exist
             row_data["profile"] = run.get("profile", "")
-            row_data["config_label"] = run.get("config_label", "")
+            row_data["config_label"] = run.get("config_label", run.get("label", ""))
             row_data["status"] = run.get("status", "")
 
-            stats_txt = Path(run["outdir"]) / "stats.txt"
+            stats_txt = _resolve_outdir(run, sim_dir) / "stats.txt"
             extracted_stats = parse_stats_file(stats_txt)
             row_data.update(extracted_stats)
 
@@ -273,7 +302,8 @@ def compute_summary(results: list[dict], output_dir: Path) -> None:
             "mean_accuracy": sum(accs) / len(accs) if accs else 0.0,
             "mean_coverage": sum(coverages) / len(coverages) if coverages else 0.0,
             "n_finished": sum(1 for r in runs if r.get("status") == "finished"),
-            "n_failed": sum(1 for r in runs if r.get("status") != "finished"),
+            "n_timed_out": sum(1 for r in runs if r.get("status") == "timed_out"),
+            "n_failed": sum(1 for r in runs if r.get("status") not in ("finished", "timed_out")),
         }
         summary_rows.append(row)
 
@@ -286,13 +316,15 @@ def compute_summary(results: list[dict], output_dir: Path) -> None:
         writer.writeheader()
         writer.writerows(summary_rows)
 
-    print(f"\n{'='*94}")
+    print(f"\n{'='*104}")
     print(f"MRP SWEEP SUMMARY — Top configurations by geomean speedup vs stock")
-    print(f"{'='*94}")
-    print(f"{'Config':<35} {'GeoSpeedup':>10} {'MeanSpeedup':>11} {'GeoIPC':>8} {'MeanIPC':>8} {'Accuracy':>8} {'Coverage':>8}")
-    print(f"{'-'*35} {'-'*10} {'-'*11} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+    print(f"{'='*104}")
+    print(f"{'Config':<35} {'Finished':>9} {'GeoSpeedup':>10} {'MeanSpeedup':>11} {'GeoIPC':>8} {'MeanIPC':>8} {'Accuracy':>8} {'Coverage':>8}")
+    print(f"{'-'*35} {'-'*9} {'-'*10} {'-'*11} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
     for row in summary_rows[:25]:
-        print(f"{row['config_label']:<35} {row['geomean_speedup']:>10.4f} {row['mean_speedup']:>11.4f} "
+        n_total = len(by_config[row['config_label']])
+        finished_str = f"{row['n_finished']}/{n_total}"
+        print(f"{row['config_label']:<35} {finished_str:>9} {row['geomean_speedup']:>10.4f} {row['mean_speedup']:>11.4f} "
               f"{row['geomean_ipc']:>8.4f} {row['mean_ipc']:>8.4f} "
               f"{row['mean_accuracy']:>8.4f} {row['mean_coverage']:>8.4f}")
 
