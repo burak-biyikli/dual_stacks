@@ -12,6 +12,7 @@ import csv
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -300,7 +301,7 @@ def build_gem5_args(run_dict: dict[str, Any]) -> list[str]:
     return args
 
 
-def execute_one(record: dict[str, Any], timeout: int) -> tuple[str, int | None, str | None]:
+def execute_one(record: dict[str, Any], timeout: int, grace_period: int = 30) -> tuple[str, int | None, str | None]:
     outdir = Path(record["outdir"])
     outdir.mkdir(parents=True, exist_ok=True)
     command = shlex.split(record["command"])
@@ -312,15 +313,42 @@ def execute_one(record: dict[str, Any], timeout: int) -> tuple[str, int | None, 
     with (outdir / "stdout.txt").open("w") as out, \
          (outdir / "stderr.txt").open("w") as err:
         try:
-            proc = subprocess.run(command, cwd=cwd, stdout=out, stderr=err,
-                                  timeout=timeout, check=False, env=env)
-            status = "finished" if proc.returncode == 0 else "failed"
-            returncode = proc.returncode
-            error = f"process exited {returncode}" if returncode != 0 else None
-        except subprocess.TimeoutExpired:
-            status = "timed_out"
+            proc = subprocess.Popen(command, cwd=cwd, stdout=out, stderr=err, env=env,
+                                    start_new_session=True)
+            try:
+                proc.wait(timeout=timeout)
+                status = "finished" if proc.returncode == 0 else "failed"
+                returncode = proc.returncode
+                error = f"process exited {returncode}" if returncode != 0 else None
+            except subprocess.TimeoutExpired:
+                status = "timed_out"
+                returncode = None
+                error = f"exceeded {timeout}s wall-clock timeout"
+                
+                # Gracefully terminate via SIGINT to the process group (covers gem5 spawned by parsecmgmt)
+                try:
+                    os.killpg(proc.pid, signal.SIGINT)
+                    proc.wait(timeout=max(1, grace_period // 2))
+                except subprocess.TimeoutExpired:
+                    # Send second SIGINT if it hasn't terminated yet
+                    try:
+                        os.killpg(proc.pid, signal.SIGINT)
+                        proc.wait(timeout=max(1, grace_period - (grace_period // 2)))
+                    except subprocess.TimeoutExpired:
+                        # Force kill if still running
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                            proc.wait(timeout=5)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                except (ProcessLookupError, PermissionError):
+                    pass
+        except Exception as e:
+            status = "failed"
             returncode = None
-            error = f"exceeded {timeout}s wall-clock timeout"
+            error = f"failed to execute or wait for process: {e}"
             
     return status, returncode, error
 
@@ -348,6 +376,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sizes", default="all", help="comma-separated sizes, or all")
     parser.add_argument("--benchmarks", default="", help="comma-separated benchmark or profile-directory names")
     parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--grace-period", type=int, default=30, help="Grace period in seconds for gem5 to clean up and dump stats after timeout (default: 30)")
     parser.add_argument("--jobs", "-j", type=int, default=None, help="number of parallel simulation jobs to run (default: min(nproc, sys_mem/mem-per-job))")
     parser.add_argument("--mem-per-job", type=float, default=2.5, help="Estimated memory required per simulation job in GB (default: 3.0)")
     parser.add_argument("--skip-build", action="store_true", help="reuse an existing gem5 binary without applying patches or running SCons")
@@ -368,7 +397,7 @@ def parse_args() -> argparse.Namespace:
     if args.jobs is None:
         args.jobs = get_default_jobs(args.mem_per_job)
         
-    for option in ("timeout", "jobs"):
+    for option in ("timeout", "jobs", "grace_period"):
         if getattr(args, option) <= 0:
             parser.error(f"--{option.replace('_', '-')} must be positive")
     return args
@@ -398,6 +427,17 @@ def main() -> int:
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_dir = Path(args.output_dir) if args.output_dir else SIM_ROOT / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    previous_runs = {}
+    manifest_path = output_dir / "run_manifest.json"
+    if manifest_path.is_file():
+        try:
+            prev_manifest = json.loads(manifest_path.read_text())
+            for r in prev_manifest.get("runs", []):
+                key = (r["profile"], r["config_label"])
+                previous_runs[key] = r
+        except Exception:
+            pass
     
     manifest: dict[str, Any] = {
         "created_at": timestamp,
@@ -452,6 +492,14 @@ def main() -> int:
                 "command": shlex.join(command),
                 **params
             }
+            # Check if this run was already completed in a previous attempt
+            prev_record = previous_runs.get((profile.name, config_label))
+            if prev_record and prev_record.get("status") == "finished":
+                stats_file = outdir / "stats.txt"
+                if stats_file.is_file() and stats_file.stat().st_size > 0:
+                    record["status"] = "finished"
+                    record["returncode"] = prev_record.get("returncode", 0)
+                    record["error"] = prev_record.get("error")
             manifest["runs"].append(record)
             
     write_manifests(output_dir, manifest)
@@ -482,9 +530,17 @@ def main() -> int:
     if args.jobs <= 1:
         for record in manifest["runs"]:
             completed_count += 1
-            status, returncode, error = execute_one(record, args.timeout)
+            if record["status"] == "finished":
+                print(f"  [{completed_count}/{len(manifest['runs'])}] ✓ {record['profile']} / {record['config_label']} (cached)")
+                continue
+            status, returncode, error = execute_one(record, args.timeout, args.grace_period)
             record.update(status=status, returncode=returncode, error=error)
-            status_icon = "✓" if status == "finished" else "✗"
+            if status == "finished":
+                status_icon = "✓"
+            elif status == "timed_out":
+                status_icon = "~"
+            else:
+                status_icon = "✗"
             print(f"  [{completed_count}/{len(manifest['runs'])}] {status_icon} {record['profile']} / {record['config_label']}")
             if status != "finished":
                 failures += 1
@@ -494,19 +550,29 @@ def main() -> int:
         with ProcessPoolExecutor(max_workers=args.jobs) as executor:
             future_to_record = {}
             for record in manifest["runs"]:
-                future = executor.submit(execute_one, record, args.timeout)
+                if record["status"] == "finished":
+                    completed_count += 1
+                    print(f"  [{completed_count}/{len(manifest['runs'])}] ✓ {record['profile']} / {record['config_label']} (cached)")
+                    continue
+                future = executor.submit(execute_one, record, args.timeout, args.grace_period)
                 future_to_record[future] = record
                 
-            for future in as_completed(future_to_record):
-                completed_count += 1
-                record = future_to_record[future]
-                status, returncode, error = future.result()
-                record.update(status=status, returncode=returncode, error=error)
-                status_icon = "✓" if status == "finished" else "✗"
-                print(f"  [{completed_count}/{len(manifest['runs'])}] {status_icon} {record['profile']} / {record['config_label']}")
-                if status != "finished":
-                    failures += 1
-                write_manifests(output_dir, manifest)
+            if future_to_record:
+                for future in as_completed(future_to_record):
+                    completed_count += 1
+                    record = future_to_record[future]
+                    status, returncode, error = future.result()
+                    record.update(status=status, returncode=returncode, error=error)
+                    if status == "finished":
+                        status_icon = "✓"
+                    elif status == "timed_out":
+                        status_icon = "~"
+                    else:
+                        status_icon = "✗"
+                    print(f"  [{completed_count}/{len(manifest['runs'])}] {status_icon} {record['profile']} / {record['config_label']}")
+                    if status != "finished":
+                        failures += 1
+                    write_manifests(output_dir, manifest)
                 
     print(f"Completed {len(manifest['runs'])} simulations; failures: {failures}.")
     return 1 if failures else 0
