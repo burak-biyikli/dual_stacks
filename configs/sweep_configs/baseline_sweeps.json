@@ -2,7 +2,7 @@
   "globals": {
     "gem5_config": "single",
     "num_cores": 1,
-    "max_insts": 1000000,
+    "max_insts": 50000000,
     "threads": 1,
     "lq_entries": 72,
     "sq_entries": 56,

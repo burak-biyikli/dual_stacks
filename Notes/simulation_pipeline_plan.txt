@@ -1,0 +1,154 @@
+Phased gem5 simulation pipeline
+===============================
+
+Phase 0: Record the plan
+------------------------
+Keep the work scoped to the benchmark configurations and
+scripts/05_run_simulations.py. Existing microbenchmark configurations remain
+unchanged.
+
+Phase 1: Dry-run driver and mock config
+---------------------------------------
+Create a copy of run_o3_mr.py that accepts benchmark sweep arguments and keeps
+the minimal topology. The driver resolves profiles and run matrices without
+building or running gem5, and writes a manifest.
+
+Phase 2: Mock simulations
+-------------------------
+Build gem5 once, run GAPBS directly and PARSEC through parsecmgmt -s, and save
+per-run logs, stats, metadata, and failure status.
+
+Phase 3: Trace-derived sweeps
+-----------------------------
+Use integer PRF values plus histogram-derived reductions, load/store port
+pairs, and per-trace LQ/SQ scaling based on provably-private stack traffic.
+
+Phase 4: Skylake-like benchmark config
+--------------------------------------
+Move to a shared benchmark system with a Skylake-like O3 core and classic
+L1/L2/LLC hierarchy. Support stock, static-only MR, full MR, and trace-sized
+LSU modes through configuration arguments.
+
+Phase 5: Best-effort multicore config
+-------------------------------------
+Add a separate, prominently unvalidated multicore entrypoint that shares the
+same construction helpers and command-line contract as the single-core config.
+
+Implementation handoff (2026-07-10)
+====================================
+
+Current status
+--------------
+Phases 0 through 5 have been fully implemented. Additionally, Phase 6 (driver
+refactoring and cleanup plan) has been implemented to support modular phase
+execution, parameter registries, robust simulation resumes, separate tracking of
+timeouts vs failures, and portable manifests with relative paths. The driver and
+configs are ready for full scale sweeps and dry runs. All tests (unit, rename
+pipeline, and commit pipeline) pass successfully.
+
+Files added or changed
+----------------------
+- scripts/05_run_simulations.py
+  JSON-driven parameter matrix runner. Supports --experiment-file, --profile-dir,
+  --sizes, --benchmarks, --timeout, --grace-period, --jobs, --mem-per-job,
+  --skip-build, --dry-run, --output-dir, and --resume.
+- scripts/06_extract_data.py
+  Post-processing stats extractor. Generates consolidated CSVs and computes config
+  aggregates and speedup summaries relative to the stock baseline configuration.
+  Supports backward-compatible header and value extraction on older manifests.
+- configs/run_o3_benchmark_mock.py
+  Minimal topology config that accepts all benchmark arguments but prints and
+  ignores the sweep knobs. Use this first for driver/config contract checks.
+- configs/benchmark_system.py
+  Shared Skylake-like SE builder and argument parser.
+- configs/run_o3_benchmark_single.py
+  Supported single-core entrypoint using the shared builder.
+- configs/run_o3_benchmark_multicore.py
+  Explicitly unvalidated multicore construction entrypoint. It is only a
+  construction smoke-test aid; do not use its results for conclusions.
+
+Implemented experiment matrix
+-----------------------------
+- Stock integer-PRF runs: explicit values plus base 180 and accepted
+  histogram-derived values. Default: 100,150,200,10%,15%.
+- Stock LSU bandwidth runs: 1:1 and 3:2 load:store ports. The default 2:1
+  baseline is represented by the stock PRF baseline and is intentionally not
+  duplicated.
+- MR static-only baseline, MR full (static plus dynamic) baseline, and MR
+   static-only with trace-derived LQ/SQ sizing.
+- Trace-derived LQ/SQ uses the overall provably-private fraction because the
+   profiler does not record privacy split separately for pushes and pops.
+
+Manifest and result behavior
+---------------------------
+- Each planned run records profile provenance/status, resolved parameters,
+  command, outdir, cwd, and final status in JSON and CSV manifests.
+- Results default to results/gem5_sim_runs/<timestamp>/.
+- Paths recorded in manifests are relative (outdir is relative to output dir,
+  profile_path is relative to project root) making results directories fully portable.
+- Timed-out trace profiles with nonzero memory counters and a histogram remain
+  eligible, and their profile status is retained in the manifest.
+- --dry-run writes only the manifest; it never patches, builds, or runs gem5.
+- --skip-build reuses an existing build/X86/gem5.opt for short validation runs;
+  normal study runs still apply patches and build once.
+- Real runs apply patches, build gem5 once, then continue after individual run
+  failures and return nonzero at the end if any failed.
+- --resume caches/skips runs that have existing, non-empty stats.txt files (even if
+  they timed out), re-runs failed ones, and defaults to the latest simulation run
+  directory.
+
+Verification already completed
+------------------------------
+- Python syntax compilation passed for the driver and all new configs.
+- A test-size dry run over the latest profile set resolved 171 runs from 18
+  profiles; 115 planned runs came from timed-out trace profiles and 18 were
+  trace-sized-LSU runs.
+- Mock config ran a 100-instruction gem5 microbenchmark and wrote stats.txt.
+- Single-core config ran the same microbenchmark with static MR, PRF=150,
+  LQ=60, SQ=48, and 2:1 ports; generated config.ini contained every value.
+- Multicore config constructed and ran a two-core, 50-instruction smoke test.
+- Stock macrobenchmark batch (gapbs_bfs_test, PRF 100/150/180/200, LSU
+  1:1/2:1/3:2) completed 6/6 runs successfully with the shared benchmark
+  config via the driver using --skip-build --skip-mr-modes.
+- Full test-size stock sweep (18 profiles, 117 runs across all GAPBS/PARSEC
+  test workloads) completed 117/117 runs successfully.
+- MR modes validated: All GAPBS (bfs, bc, cc, pr, sssp, tc) and PARSEC
+  (blackscholes) benchmarks complete successfully with static and full MR modes,
+  showing active predictions (VPpredicted/VPcorrect stats present).
+- Full test-size MRP tuning sweep (18 profiles, 234 runs across all GAPBS/PARSEC
+  test workloads) using `mrp_tuning.json` completed 234/234 runs successfully. Resolved
+  concurrency conflicts in parallel PARSEC runs by isolating their workspaces
+  via `parsecmgmt -d`, and fixed a configuration label key lookup in `06_extract_data.py`.
+- Verified cleanup plan and resume functionality end-to-end on test size matrix runs
+  with zero failures, verifying backward compatibility on older manifest layouts.
+
+Known caveats / next work
+-------------------------
+1. COMPLETE: The restricted gapbs_bfs/test mock-config batch completed all
+   four planned runs successfully with --skip-build. The final manifest is at
+   /tmp/dual_stacks_driver_mock_complete/run_manifest.json (temporary
+   validation output, not a study result).
+2. COMPLETE: Repeated that restricted batch with
+   configs/run_o3_benchmark_single.py to validate the real shared benchmark
+   config through the driver for stock modes. 6/6 runs completed.
+3. COMPLETE: MR modes now complete successfully on GAPBS/PARSEC binaries.
+   All unit tests (16), rename pipeline tests (8), and commit pipeline tests (13) pass.
+   The MR implementation in run_o3_mr.py and run_o3_stock.py works correctly.
+4. COMPLETE: PARSEC's parsecmgmt -s launcher end-to-end validation confirmed.
+   The driver correctly handles PARSEC workload execution with MR modes.
+5. TODO: Revisit cache sizes and memory capacity before collecting study results:
+   they currently mirror the inspected reference config (8 KiB L1s, 256 KiB
+   L2, 16 MiB LLC, 8 GiB range), including its known DRAM capacity warning.
+6. Multicore workload placement/sharing is intentionally not validated. Keep
+   --config single as the only supported measurement mode.
+7. Consider adding dedicated unit tests for profile filtering, histogram PRF
+   resolution, queue sizing, and command construction if this becomes a
+   shared long-lived runner.
+
+Defaults
+--------
+- Latest profiling timestamp; all workloads and sizes.
+- 1,000,000 instructions and a 600-second wall-clock timeout.
+- Integer PRF sweep: 100,150,200,10%,15%, retaining baseline 180.
+- LSU port pairs: 1:1, 2:1, 3:2.
+- Timed-out profiles with useful counters and histograms remain eligible.
